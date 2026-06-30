@@ -1,0 +1,9 @@
+pandas>=2.0
+pyarrow>=14.0
+
+# Added in later phases (not needed for the scripts in precompute/ yet):
+# sentence-transformers   # build_index.py — candidate/JD embeddings
+# faiss-cpu                # build_index.py — semantic shortlist
+# rank-bm25                 # build_index.py — keyword shortlist
+# lightgbm                  # train_ranker.py — learned reranker
+# llama-cpp-python           # reasoning.py — local quantized LLM
