@@ -4,7 +4,9 @@ precompute/artifacts/*.parquet
 precompute/artifacts/faiss.index
 precompute/artifacts/bm25.pkl
 precompute/artifacts/*.npy
-# Also ignore local artifacts
-artifacts/
+# Ignore only large artifacts
+artifacts/*.parquet
+artifacts/faiss.index
+artifacts/bm25.pkl
 .venv/
 __pycache__/
