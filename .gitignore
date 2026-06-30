@@ -1,0 +1,10 @@
+candidates.jsonl.gz
+candidates.jsonl
+precompute/artifacts/*.parquet
+precompute/artifacts/faiss.index
+precompute/artifacts/bm25.pkl
+precompute/artifacts/*.npy
+# Also ignore local artifacts
+artifacts/
+.venv/
+__pycache__/
