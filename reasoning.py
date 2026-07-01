@@ -60,6 +60,45 @@ def verify_grounding(text: str, allowed_skills: list[str], allowed_companies: li
     return True
 
 
+# Fallback generation using a looser LLM prompt that forbids specific names/skills to guarantee grounding.
+def generate_looser_reasoning(model, tokenizer, yoe: float, title: str, rank: int, gap: str) -> str:
+    if rank <= 20:
+        messages = [
+            {"role": "system", "content": "You are a professional recruiting assistant. Summarize this candidate's fit in exactly one short, complete sentence (under 12 words). Do NOT mention any specific company names or technical skill names. Just describe their role, experience, and rank."},
+            {"role": "user", "content": f"Facts:\n- Role: {title}\n- Experience: {yoe} years\n- Rank: #{rank} of 100\n\nRules:\n1. Limit output to 12 words.\n2. Do NOT mention any specific company names or technical tools.\n3. Output a complete sentence."}
+        ]
+    else:
+        messages = [
+            {"role": "system", "content": "You are a professional recruiting assistant. Summarize this candidate's fit in exactly one short, complete sentence (under 15 words) politely mentioning the concern. Do NOT mention any specific company names or technical skill names."},
+            {"role": "user", "content": f"Facts:\n- Role: {title}\n- Experience: {yoe} years\n- Rank: #{rank} of 100\n- Concern: {gap}\n\nRules:\n1. Limit output to 15 words.\n2. Do NOT mention any specific company names or technical tools.\n3. Politely mention the concern.\n4. Output a complete sentence."}
+        ]
+        
+    with torch.no_grad():
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        model_inputs = tokenizer([text], return_tensors="pt").to("cpu")
+        generated_ids = model.generate(
+            model_inputs.input_ids,
+            max_new_tokens=35,
+            temperature=0.1,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        
+    if not response.endswith((".", "!", "?")):
+        matches = list(re.finditer(r'[.!?](?:\s|$)', response))
+        if matches:
+            last_punc_idx = matches[-1].start()
+            response = response[:last_punc_idx + 1]
+        else:
+            response = response + "."
+            
+    return response
+
+
 # Generates reasoning statements for the final 100 candidates.
 def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
     model, tokenizer = _get_model_and_tokenizer()
@@ -127,7 +166,7 @@ def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
             gap = "low recruiter response rate and profile activity"
             
         # Allowed lists for validation
-        allowed_skills = matched_skills
+        allowed_skills = skills_list
         allowed_cos = list(set(companies))
         
         # Prompt
@@ -164,12 +203,9 @@ def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
             else:
                 response = ""  # Force fallback if no sentence ending exists
         
-        # Verify grounding and fallback if ungrounded or empty
+        # Verify grounding and fallback to a looser LLM call if ungrounded or empty
         if not response or not verify_grounding(response, allowed_skills, allowed_cos):
-            if rank <= 20:
-                response = f"AI Engineer with {yoe} years of experience at {company}, skilled in {', '.join(matched_skills[:2])}. Ranked #{rank} for search and matching."
-            else:
-                response = f"AI Engineer with {yoe} years of experience at {company}, skilled in {', '.join(matched_skills[:2])}. Ranked #{rank} but has {gap}."
+            response = generate_looser_reasoning(model, tokenizer, yoe, title, rank, gap)
                 
         reasonings.append(response)
         
