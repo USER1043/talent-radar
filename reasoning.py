@@ -8,8 +8,23 @@ from __future__ import annotations
 import json
 import re
 import hashlib
+import torch
 import pandas as pd
 from dataclasses import dataclass
+
+_MODEL = None
+_TOKENIZER = None
+
+
+# Loads the local Qwen model and tokenizer lazily.
+def _get_model_and_tokenizer():
+    global _MODEL, _TOKENIZER
+    if _MODEL is None:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+        _TOKENIZER = AutoTokenizer.from_pretrained(model_name)
+        _MODEL = AutoModelForCausalLM.from_pretrained(model_name, device_map="cpu")
+    return _MODEL, _TOKENIZER
 
 
 @dataclass
@@ -281,19 +296,22 @@ def plan_reason(
     )
 
 
+# Helper helper function for checking evidence text names.
+def summary_comp_check(evidence: list[str]) -> str:
+    return " ".join(evidence).lower()
+
+
 # Validates that the generated summary statement has no logical contradictions or pronoun leaks.
 def validate_explanation(summary: str, plan: ReasonPlan) -> str:
     # Leak Checks
     first_person_markers = ["i ", "my ", "we ", "our ", "us ", "me "]
     for marker in first_person_markers:
         if marker in summary.lower():
-            # Strip or rewrite first person pronouns
             summary = re.sub(r"\b(my|our|us|me)\b", "the", summary, flags=re.IGNORECASE)
             summary = re.sub(r"\b(i)\b", "candidate", summary, flags=re.IGNORECASE)
 
     # Logic self-correction rules to prevent invalid claims
     if plan.rank <= 10:
-        # Top rank must not contain severe dismissive phrases
         summary = summary.replace("is caution-flagged", "presents a minor notice constraint")
         summary = summary.replace("evaluated as a high risk candidate", "has a structured background")
         
@@ -303,97 +321,177 @@ def validate_explanation(summary: str, plan: ReasonPlan) -> str:
     return summary
 
 
-# Converts a structured ReasonPlan object into recruiter-style English.
-def generate_summary_from_plan(plan: ReasonPlan) -> str:
+# Fallback template variation generator in case LLM fails.
+def fallback_summary_generator(plan: ReasonPlan) -> str:
     dec = plan.decision
     evidence_str = " and ".join(plan.evidence)
+    seed = int(hashlib.md5(plan.candidate_id.encode()).hexdigest(), 16) % 100
     
-    # 1. Handle Top Rank Candidates (Ranks 1-10)
     if plan.rank <= 10:
-        summary = (
-            f"Ranked #{plan.rank} because the profile combines {dec.strongest_positive.lower()}, "
-            f"recent hands-on engineering work, and {evidence_str}. "
-            f"No significant hiring constraints prevented placement at the top of the list."
-        )
+        starters = [
+            f"Ranked #{plan.rank} because the profile combines {dec.strongest_positive.lower()}, recent hands-on engineering work, and {evidence_str}. No significant hiring constraints prevented placement at the top of the list.",
+            f"Placed at #{plan.rank} as the candidate profile combines {dec.strongest_positive.lower()} with recent hands-on work and {evidence_str}. No major pipeline constraints affected top ranking.",
+            f"Ranked #{plan.rank} matching the top-tier requirement profile. Combines {dec.strongest_positive.lower()} and recent hands-on work with {evidence_str} without any notable hiring constraints."
+        ]
+        summary = starters[seed % len(starters)]
         if plan.differentiator_beats:
             summary += f" Stands out from adjacent profiles by offering {plan.differentiator_beats}."
         return validate_explanation(summary, plan)
 
-    # 2. Handle Lower Ranked Candidates (Ranks 11-100) with impressive titles or companies
     imposing_companies = ["google", "apple", "microsoft", "amazon", "netflix", "adobe", "meta", "salesforce"]
-    has_big_pedigree = any(c in dec.strongest_positive.lower() or c in dec.strongest_negative.lower() or c in summary_comp_check(plan.evidence) for c in imposing_companies)
-    
-    # Check if candidate analysis has a prestigious current/past employer
     is_big_tech = False
     for comp in imposing_companies:
         if comp in dec.strongest_positive.lower() or comp in dec.strongest_negative.lower():
             is_big_tech = True
 
     if plan.rank > 20 and is_big_tech:
-        summary = (
-            f"Although the candidate offers a pedigree profile with experience matching {dec.strongest_positive.lower()}, "
-            f"they are positioned lower at #{plan.rank} because {dec.why_not_higher}. "
-            f"Placement is anchored here as they maintain {dec.why_not_lower}."
-        )
+        starters = [
+            f"Although the candidate offers a pedigree profile with experience matching {dec.strongest_positive.lower()}, they are positioned lower at #{plan.rank} because {dec.why_not_higher}. Placement is anchored here as they maintain {dec.why_not_lower}.",
+            f"While the candidate brings pedigree experience matching {dec.strongest_positive.lower()}, the profile is ranked at #{plan.rank} because {dec.why_not_higher}. Upward progression is capped, though their position is anchored by {dec.why_not_lower}.",
+            f"Offers a tech pedigree profile with experience matching {dec.strongest_positive.lower()}, but ranks lower at #{plan.rank} because {dec.why_not_higher}. Secured here due to {dec.why_not_lower}."
+        ]
+        summary = starters[seed % len(starters)]
         return validate_explanation(summary, plan)
 
-    # 3. General Persona-Based Tradeoff Explanations (Ranks 11-100)
     if plan.persona == "High Risk":
-        summary = (
-            f"Ranked #{plan.rank} primarily due to {dec.strongest_negative.lower()}, which acts as a primary constraint. "
-            f"While they present {evidence_str}, {dec.why_not_higher}, keeping them below top-tier candidates."
-        )
+        starters = [
+            f"Ranked #{plan.rank} primarily due to {dec.strongest_negative.lower()}, which acts as a primary constraint. While they present {evidence_str}, {dec.why_not_higher}, keeping them below top-tier candidates.",
+            f"Placement at #{plan.rank} is restricted due to {dec.strongest_negative.lower()}; this constraint keeps them below the top list. Although they demonstrate {evidence_str}, {dec.why_not_higher}.",
+            f"Positioned at #{plan.rank} because the profile presents a key limitation of {dec.strongest_negative.lower()}. While they bring {evidence_str}, upward movement is limited because {dec.why_not_higher}."
+        ]
+        summary = starters[seed % len(starters)]
     elif plan.persona == "Strong Product Engineer":
-        summary = (
-            f"Positioned at #{plan.rank} representing a solid candidate with {evidence_str}. "
-            f"They do not rank higher because {dec.why_not_higher}; however, they remain anchored here due to {dec.why_not_lower}."
-        )
+        starters = [
+            f"Positioned at #{plan.rank} representing a solid candidate with {evidence_str}. They do not rank higher because {dec.why_not_higher}; however, they remain anchored here due to {dec.why_not_lower}.",
+            f"Placed at #{plan.rank} as a strong product engineer offering {evidence_str}. Upward ranking is constrained as {dec.why_not_higher}, but they maintain this position because {dec.why_not_lower}.",
+            f"Brings a robust profile at #{plan.rank} highlighted by {evidence_str}. While {dec.why_not_higher} restricts them from higher slots, they avoid falling lower due to {dec.why_not_lower}."
+        ]
+        summary = starters[seed % len(starters)]
     elif plan.persona == "Senior Specialist":
-        summary = (
-            f"Placed at #{plan.rank} offering senior-level specialist background. "
-            f"Further upward placement is limited as {dec.why_not_higher}, but they beat lower profiles due to {dec.why_not_lower}."
-        )
-    elif plan.persona == "Elite Match": # Fallback if rank > 10 but persona Elite
-        summary = (
-            f"Ranked at #{plan.rank} demonstrating strong JD compatibility. "
-            f"Timeline constraints like {dec.strongest_negative.lower()} restrict them from the top 10 positions."
-        )
+        starters = [
+            f"Placed at #{plan.rank} offering senior-level specialist background. Further upward placement is limited as {dec.why_not_higher}, but they beat lower profiles due to {dec.why_not_lower}.",
+            f"Offers senior specialist expertise at #{plan.rank}. They are kept out of higher tiers because {dec.why_not_higher}, though their position is secured by {dec.why_not_lower}.",
+            f"Ranked #{plan.rank} with a focus on senior technical specialization. The profile is limited because {dec.why_not_higher}, but maintains value due to {dec.why_not_lower}."
+        ]
+        summary = starters[seed % len(starters)]
+    elif plan.persona == "Elite Match":
+        starters = [
+            f"Ranked at #{plan.rank} demonstrating strong JD compatibility. Timeline constraints like {dec.strongest_negative.lower()} restrict them from the top 10 positions.",
+            f"Holds rank #{plan.rank} as a high-compatibility profile. However, {dec.strongest_negative.lower()} prevents them from placing higher on the list.",
+            f"Brings high-quality alignment at #{plan.rank}, though {dec.strongest_negative.lower()} keeps them outside the top-tier rankings."
+        ]
+        summary = starters[seed % len(starters)]
     else:  # General trade-off template
-        summary = (
-            f"Ranked at #{plan.rank} based on {dec.primary_reason}. "
-            f"Brings {evidence_str}, but {dec.why_not_higher}. "
-            f"They maintain position ahead of lower candidates because {dec.why_not_lower}."
-        )
+        starters = [
+            f"Ranked at #{plan.rank} based on {dec.primary_reason}. Brings {evidence_str}, but {dec.why_not_higher}. They maintain position ahead of lower candidates because {dec.why_not_lower}.",
+            f"Placed at #{plan.rank} due to {dec.primary_reason}. The profile offers {evidence_str}, but is limited because {dec.why_not_higher}. Position is secured because {dec.why_not_lower}.",
+            f"Positioned at #{plan.rank} showing {dec.primary_reason}. While they offer {evidence_str}, {dec.why_not_higher}. They avoid lower placement because {dec.why_not_lower}."
+        ]
+        summary = starters[seed % len(starters)]
 
     if plan.differentiator_beats and plan.rank % 2 == 0:
         summary += f" They stand out from lower-ranked profiles via {plan.differentiator_beats}."
-
+        
     return validate_explanation(summary, plan)
 
 
-# Helper helper function for checking evidence text names.
-def summary_comp_check(evidence: list[str]) -> str:
-    return " ".join(evidence).lower()
-
-
-# Runs the decision-analysis and reasoning generation pipeline.
+# Runs the decision-analysis and reasoning generation pipeline with batched guided Qwen execution.
 def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
     analyses = []
     for _, row in candidates_df.iterrows():
         analyses.append(analyze_candidate(row))
         
-    reasonings = []
+    plans = []
     for idx, analysis in enumerate(analyses):
-        # Retrieve adjacent candidate profiles for context-aware differentiators
         prev_analysis = analyses[idx - 1] if idx - 1 >= 0 else None
         next_analysis = analyses[idx + 1] if idx + 1 < len(analyses) else None
-        
-        # 1. Plan ranking reason
         rank = idx + 1
-        plan = plan_reason(analysis, prev_analysis, next_analysis, rank)
+        plans.append(plan_reason(analysis, prev_analysis, next_analysis, rank))
+
+    try:
+        torch.set_num_threads(8)
+        model, tokenizer = _get_model_and_tokenizer()
         
-        # 2. Format into recruiter summary text
-        summary = generate_summary_from_plan(plan)
-        reasonings.append(summary)
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
         
-    return reasonings
+        prompts = []
+        for plan in plans:
+            dec = plan.decision
+            evidence_str = ", ".join(plan.evidence)
+            
+            facts = (
+                f"- Candidate Rank: #{plan.rank} of 100\n"
+                f"- Candidate Persona: {plan.persona}\n"
+                f"- Primary Strength: {dec.primary_reason}\n"
+                f"- Supporting Evidence: {evidence_str}\n"
+                f"- Hiring Constraint: {dec.strongest_negative if dec.strongest_negative else 'none'}\n"
+                f"- Limit reason (why not higher): {dec.why_not_higher}\n"
+                f"- Differentiator: {plan.differentiator_beats if plan.differentiator_beats else 'none'}"
+            )
+            
+            messages = [
+                {"role": "system", "content": (
+                    "You are a professional recruiting coordinator. Write a brief, objective 1-2 sentence candidate summary "
+                    "for a hiring manager using only the facts below. Your explanation MUST justify why this candidate is at "
+                    "this exact rank and describe the trade-offs (e.g. why not higher). Do NOT use first-person pronouns (I, my, our, we).\n\n"
+                    "Few-Shot Examples:\n\n"
+                    "Facts:\n"
+                    "- Candidate Rank: #12 of 100\n"
+                    "- Candidate Persona: Senior Specialist\n"
+                    "- Primary Strength: strong search and retrieval core skills alignment\n"
+                    "- Supporting Evidence: strong search alignment, product experience\n"
+                    "- Hiring Constraint: 90-day notice period constraint\n"
+                    "- Limit reason (why not higher): their long 90-day notice period introduces timeline risk\n"
+                    "- Differentiator: shorter notice period timeline\n"
+                    "Summary:\n"
+                    "Placed at #12, the candidate offers senior specialist depth with strong search alignment. They are kept out of higher tiers because their long 90-day notice period introduces timeline risk, but they beat lower profiles due to their product experience.\n\n"
+                    "Facts:\n"
+                    "- Candidate Rank: #98 of 100\n"
+                    "- Candidate Persona: High Risk\n"
+                    "- Primary Strength: relevant product systems background\n"
+                    "- Supporting Evidence: product experience\n"
+                    "- Hiring Constraint: 120-day notice period constraint\n"
+                    "- Limit reason (why not higher): their long 120-day notice period introduces timeline risk\n"
+                    "- Differentiator: none\n"
+                    "Summary:\n"
+                    "Ranked #98 primarily due to their 120-day notice period constraint, which acts as a primary timeline risk. While they present product experience, their long notice period limits their ranking and keeps them below top-tier candidates."
+                )},
+                {"role": "user", "content": f"Facts:\n{facts}\n\nSummary:"}
+            ]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompts.append(text)
+            
+        inputs = tokenizer(prompts, padding=True, return_tensors="pt").to("cpu")
+        
+        with torch.no_grad():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=85,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+        reasonings = []
+        for idx, plan in enumerate(plans):
+            input_len = len(inputs.input_ids[idx])
+            output_ids = generated_ids[idx][input_len:]
+            response = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+            
+            response = response.replace("\n", " ").strip()
+            
+            if not response.endswith((".", "!", "?")):
+                matches = list(re.finditer(r'[.!?](?:\s|$)', response))
+                if matches:
+                    last_punc_idx = matches[-1].start()
+                    response = response[:last_punc_idx + 1]
+                else:
+                    response = response + "."
+            
+            reasonings.append(validate_explanation(response, plan))
+            
+        return reasonings
+
+    except Exception as e:
+        print(f"LLM Batch generation failed: {e}. Falling back to multi-template.")
+        return [fallback_summary_generator(p) for p in plans]
