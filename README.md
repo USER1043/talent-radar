@@ -1,3 +1,16 @@
+---
+title: Talent Radar — Candidate Explorer
+emoji: 🎯
+colorFrom: red
+colorTo: pink
+sdk: streamlit
+sdk_version: "1.45.1"
+python_version: "3.13"
+app_file: app.py
+pinned: false
+short_description: Interactive dashboard for exploring top-ranked AI/ML engineer candidates.
+---
+
 # Talent Radar — Redrob Hackathon Submission
 
 AI/ML candidate ranking pipeline for the Redrob Senior AI/ML Engineer JD.
