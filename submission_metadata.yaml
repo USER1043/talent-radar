@@ -1,0 +1,81 @@
+# Redrob Hackathon — Submission Metadata
+
+team_name: "AI_Wrappers"
+
+primary_contact:
+  name: "Prajan Karthik"
+  email: "prjnkrthk@gmail.com"
+  phone: "+91-6374408650"
+
+team_members:
+  - name: "Prajan Karthik"
+    email: "prjnkrthk@gmail.com"
+    role: "Solo Participant"
+
+# ============================================================================
+# Code and reproducibility
+# ============================================================================
+github_repo: "https://github.com/USER1043/talent-radar"
+
+sandbox_link: "https://huggingface.co/spaces/HuggingFace1043/talent-radar-redrob-sandbox"
+
+reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
+
+# ============================================================================
+# Compute environment
+# ============================================================================
+compute:
+  platform: "Local Linux Machine (EndeavourOS)"
+  cpu_cores: 16
+  ram_gb: 14
+  python_version: "3.13.12"
+  os: "EndeavourOS Linux (Kernel 7.0.12-arch1-1)"
+  uses_gpu_for_inference: false
+  has_network_during_ranking: false
+  pre_computation_required: true
+  pre_computation_time_minutes: 30  # Approximately 30–40 minutes
+
+# ============================================================================
+# AI tools declaration
+# ============================================================================
+ai_tools_used:
+  - "Antigravity (Google DeepMind)"
+  - "Claude AI (Web)"
+
+ai_usage_summary: |
+  Antigravity (Google DeepMind's agentic coding assistant) was used throughout
+  development for architecture design, code generation, debugging, and iterative
+  refinement of the ranking pipeline. Claude AI (web) was used for high-level
+  architecture discussions and approach validation. No candidate data was fed
+  to any external LLM. The on-device Qwen 2.5 0.5B model used for reasoning
+  generation runs entirely offline with no network access during ranking.
+
+# ============================================================================
+# Approach summary
+# ============================================================================
+methodology_summary: |
+  Hybrid retrieval-augmented ranking pipeline over 100K candidates. Offline
+  pre-computation parses JSONL records into a flat feature table, builds a
+  FAISS semantic index (all-MiniLM-L6-v2 embeddings) and a BM25 lexical index,
+  and flags honeypot candidates via OR-logic implausibility rules (tenure
+  inconsistencies, zero-duration advanced skills, implausible YOE, etc.).
+
+  At ranking time, a union of the top-1500 FAISS and top-1500 BM25 hits forms
+  a ~4–5K shortlist. Per-candidate structured features are extracted
+  (JD rule signals, behavioral score, notice-period penalty) and combined with
+  semantic similarity scores. A Ridge regression ranker (trained on 150
+  hand-labeled pairs; Ridge outperformed LightGBM LambdaRank on held-out
+  NDCG@10 at this label count) produces the final score. Honeypots are
+  hard-filtered before top-100 selection. Reasoning is generated on-device
+  using Qwen 2.5 0.5B (CPU, bfloat16) with a two-stage grounded prompt
+  strategy and a word-set intersection check to prevent hallucination.
+
+# ============================================================================
+# Declarations
+# ============================================================================
+declarations:
+  read_submission_spec: true
+  code_is_original_work: true
+  no_collusion: true
+  honeypot_check_done: true
+  reproduction_tested: true
