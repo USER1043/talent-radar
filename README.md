@@ -63,31 +63,6 @@ train_ranker.py → ranker_model.pkl          Stage 10 Write CSV + self-validate
 
 ---
 
-## Repository layout
-
-```
-.
-├── README.md
-├── requirements.txt
-├── rank.py                    # graded entry point
-├── reasoning.py               # LLM generation + grounding check
-├── features_utils.py          # shared feature extraction helpers
-├── schema_utils.py            # candidate schema helpers
-├── parse_candidates.py        # precompute: JSONL → features.parquet
-├── company_stats.py           # precompute: company timeline stats
-├── honeypot_flags.py          # precompute: implausibility flags
-├── build_index.py             # precompute: FAISS + BM25 + JD embeddings
-├── label_eval_set.py          # precompute: sample diverse candidates for hand-labeling
-├── train_ranker.py            # precompute: LightGBM vs Ridge bake-off
-├── artifacts/
-│   ├── eval_set.csv           # 150 hand-labeled candidate–JD pairs (0–5 scale)
-│   ├── ranker_model.pkl       # Ridge ranker (winner of bake-off)
-│   └── jd_embeddings.npy     # JD + ideal-candidate sentence embeddings
-└── submission.csv             # latest ranked output (100 candidates)
-```
-
----
-
 ## Key design decisions
 
 - **Hybrid retrieval**: FAISS (semantic) ∪ BM25 (keyword) shortlist of ~4–5K,
