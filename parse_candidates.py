@@ -63,9 +63,42 @@ def iter_records(path: Path) -> Iterator[dict]:
                 yield json.loads(line)
 
 
+FIRST_PERSON_PATTERNS = [
+    (r"\bI am\b", "The candidate is"),
+    (r"\bI'm\b", "The candidate is"),
+    (r"\bI have\b", "The candidate has"),
+    (r"\bI've\b", "The candidate has"),
+    (r"\bmy experience\b", "their experience"),
+    (r"\bmy background\b", "their background"),
+    (r"\bmyself\b", "themself"),
+    (r"\bI work\b", "The candidate works"),
+]
+
+import re
+
+def sanitize_first_person(text: str) -> str:
+    if not text:
+        return ""
+    for pattern, replacement in FIRST_PERSON_PATTERNS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
 def flatten(record: dict) -> dict:
     profile = record["profile"]
+    
+    # Sanitize profile fields in place
+    if "headline" in profile:
+        profile["headline"] = sanitize_first_person(profile["headline"])
+    if "summary" in profile:
+        profile["summary"] = sanitize_first_person(profile["summary"])
+        
     career = record.get("career_history", []) or []
+    # Sanitize career descriptions in place
+    for c in career:
+        if "description" in c:
+            c["description"] = sanitize_first_person(c["description"])
+            
     skills = record.get("skills", []) or []
     signals = record.get("redrob_signals", {}) or {}
     education = record.get("education", []) or []
@@ -143,6 +176,7 @@ def flatten(record: dict) -> dict:
         # full structures, re-parsed downstream where needed
         "career_history_json": json.dumps(career),
         "skills_json": json.dumps(skills),
+        "education_json": json.dumps(education),
     }
 
     for key in SIMPLE_SIGNAL_FIELDS:
