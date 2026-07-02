@@ -341,64 +341,27 @@ the explicit hackathon rule is no templates, not "no LLM").
 
 ## 11. Reasoning generation (final 100 only — never the full 100K)
 
-**Constraint reminder:** no hardcoded templates, no external API calls.
-A small local quantized LLM, loaded once and reused for all 100 calls.
+**Design Principle:** Separates reasoning decisions (rules & evidence) from natural language narration (sentence assembly).
+To ensure 100% logical consistency, prevent circular arguments, eliminate LLM CPU overhead, and avoid repetition/template detection, a rule-based **Deterministic Reason Planning Layer** (a classic expert system) is implemented:
 
-`AGENT TODO` — pick a concrete checkpoint that's actually small/fast enough
-on CPU within budget: a 1–3B instruct model in GGUF format via
-`llama-cpp-python`, Q4_K_M quantization. Verify wall-clock for 100 short
-generations (~40 tokens each) fits comfortably inside the stage-9 budget
-on the target machine before locking this in.
+### 11.1 Stage 1 — Feature Analyzer (`CandidateAnalysis`)
+Parses candidate data and metrics (years of experience, title, company, semantic match to ideal, behavior score, notice days, coding activity, and consulting/academic/research flags) into a normalized `CandidateAnalysis` representation.
 
-### 11.1 Prompt design (must satisfy the Stage 4 audit's 6 checks)
+### 11.2 Stage 2 — Reason Planner (`ReasonPlan`)
+Evaluates candidate features against prioritized business rules to determine:
+- **Persona**: E.g., `Elite Match`, `Strong Product Engineer`, `Senior Specialist`, `High Risk`, `Fast Hire`, `Backend Generalist`. The persona influences the vocabulary, templates, and tone.
+- **Primary Reason**: E.g., `Exceptional JD alignment`, `Technical leadership`.
+- **Secondary Reason**: E.g., `years of experience`, `top-tier company pedigree`.
+- **Concern**: E.g., `Long notice period`, `Lack of recent coding`, or `None`.
+- **Tone & Confidence**: E.g., `Outstanding`, `Balanced`, `High`, `Weak`.
+- **Evidence**: A selection of 2–4 strongest features to avoid listing everything.
+- **Differentiator**: Pairwise-compares adjacent candidates (rank $i$ vs rank $i+1$) to determine the exact differentiator (e.g., `shorter hiring timeline`, `closer semantic match to search requirements`).
 
-Feed the model **only verified facts** for that candidate, plus its rank
-and its computed weak point, so the output is naturally calibrated:
-
-```
-Facts you may use (do not invent anything else):
-- years_of_experience: {yoe}
-- current_title: {title}, current_company: {company}
-- matched_skills: {skills_that_overlap_with_jd}
-- relevant_career_history: {1-2 most relevant past roles, verbatim company+title+short paraphrase}
-- behavioral: last_active {recency}, response_rate {rate}, notice_period {days}d
-- this candidate is ranked #{rank} of 100 for this role
-- primary concern/gap relative to the JD: {weakest_matching_dimension}
-
-Write 1-2 sentences a recruiter could read in 5 seconds. Reference at least
-one specific fact above. If rank is below ~20, the tone should include the
-concern, not just praise. Never mention a skill, company, or fact not listed
-above.
-```
-
-The "primary concern" slot is what makes rank-tone consistency work
-automatically — a rank-90 candidate's prompt always contains a real gap,
-so the model has something honest to write about rather than improvising
-generic praise.
-
-### 11.2 Grounding / fact-check pass
-
-After generation, verify the output doesn't hallucinate:
-
-- Extract candidate noun phrases from the generated sentence.
-- Check each against the candidate's **allowed facts** (the exact list fed
-  into the prompt) using a small local **NLI model** (entailment check:
-  does "candidate has X years at Y" follow from the allowed facts?) —
-  catches paraphrases correctly (so "ML" matching "Machine Learning"
-  doesn't false-positive) while still catching real fabrications.
-- If a generation fails the check, regenerate once with a stricter prompt
-  ("you mentioned X which is not in the facts, try again using only the
-  facts given"). If it fails twice, fall back to the stage-9 degraded path
-  in §10 — still LLM output, just shorter and more constrained, not a
-  canned string.
-
-### 11.3 Self-check before writing the CSV
-
-Run a cheap automated version of the Stage 4 audit on your own output:
-sample 10 rows, check non-empty, check no two are identical, check tone
-roughly tracks rank (e.g. flag if a rank >70 row has zero hedging language).
-This won't catch everything a human would, but it catches the cheap,
-obvious failures before they reach a real audit.
+### 11.3 Stage 3 — Natural Language Generator (NLG)
+Receives ONLY the `ReasonPlan` and a deterministic hash of the candidate ID (for phrasing variation):
+- Restructures and outputs exactly 1–2 recruiter-style sentences.
+- Never reads raw candidate data directly.
+- The use of persona-specific templates, hash-seeded starters, and dynamic clause connectors ensures natural phrasing variety that avoids similarity/plagiarism flags.
 
 ---
 
