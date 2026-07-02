@@ -1,5 +1,5 @@
 """
-@file Generates grounded reasoning statements for the top-ranked candidates using a local LLM.
+@file Deterministic reasoning generation pipeline for candidate ranking.
 @package online_ranking
 """
 
@@ -7,806 +7,326 @@ from __future__ import annotations
 
 import json
 import re
-import torch
+import hashlib
 import pandas as pd
-import difflib
-from pathlib import Path
-
-_MODEL = None
-_TOKENIZER = None
+from dataclasses import dataclass
 
 
-# Loads the local Qwen model and tokenizer lazily.
-def _get_model_and_tokenizer():
-    global _MODEL, _TOKENIZER
-    if _MODEL is None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-        _TOKENIZER = AutoTokenizer.from_pretrained(model_name)
-        _MODEL = AutoModelForCausalLM.from_pretrained(model_name, device_map="cpu")
-    return _MODEL, _TOKENIZER
+@dataclass
+class CandidateAnalysis:
+    """Normalized candidate feature representation for rule-based planning."""
+    candidate_id: str
+    yoe: float
+    title: str
+    company: str
+    semantic_match: float
+    behavior_score: float
+    notice_days: float
+    has_recent_coding: bool
+    consulting_only: bool
+    open_source: bool
+    publications: bool
+    leadership: bool
 
 
-# Checks if the response contains any logical contradictions or incorrect comparisons for notice days.
-def has_notice_hallucination(resp: str, days: float) -> bool:
-    if pd.isna(days):
-        return False
-    days_int = int(days)
-    resp_lower = resp.lower()
+@dataclass
+class ReasonPlan:
+    """Recruiter reasoning plan containing planned drivers and differentiator."""
+    candidate_id: str
+    persona: str
+    primary_reason: str
+    secondary_reason: str
+    concern: str | None
+    tone: str
+    confidence: str
+    evidence: list[str]
+    differentiator: str | None
+
+
+# Maps specific titles to leadership flag.
+def _check_leadership(title: str) -> bool:
+    t = title.lower()
+    return any(x in t for x in ["lead", "staff", "principal", "manager", "director", "head", "architect"])
+
+
+# Creates a normalized CandidateAnalysis dataclass representation from a pandas row.
+def analyze_candidate(row: pd.Series) -> CandidateAnalysis:
+    title = str(row.get("current_title", "Engineer")).strip()
+    company = str(row.get("current_company", "Private")).strip()
+    narrative = str(row.get("narrative_text", "")).lower()
     
-    # 1. Catch "preferred/preference of X" where X > 30
-    if days > 30:
-        bad_pref_patterns = [
-            f"preferred {days_int}",
-            f"preference of {days_int}",
-            f"preferred notice of {days_int}",
-            f"preferred notice period of {days_int}",
-            f"{days_int}-day preference",
-            f"{days_int} day preference",
-            f"preference is {days_int}",
-            f"buyout of {days_int}",
-            f"buy out of {days_int}"
-        ]
-        for p in bad_pref_patterns:
-            if p in resp_lower:
-                return True
-                
-    # 2. Catch comparative self-contradictions (e.g. "more than X", "less than X", "longer than X", "shorter than X")
-    bad_comp_patterns = [
-        f"more than {days_int}",
-        f"less than {days_int}",
-        f"longer than {days_int}",
-        f"shorter than {days_int}",
-        f"exceeds {days_int}"
-    ]
-    for p in bad_comp_patterns:
-        if p in resp_lower:
-            return True
-            
-    return False
-
-
-# Verifies that any numbers appearing in the response are grounded in the allowed numbers.
-def verify_number_grounding(resp: str, allowed_numbers: list[str]) -> bool:
-    found_numbers = re.findall(r"\b\d+\b", resp)
-    for num in found_numbers:
-        if num not in allowed_numbers:
-            return False
-    return True
-
-
-# Checks if the generated text is strictly grounded in the allowed facts.
-def verify_grounding(text: str, allowed_skills: list[str], allowed_companies: list[str]) -> bool:
-    text_lower = text.lower()
-    # Split text into a set of whole words for safe word-boundary matching
-    text_words = set(re.findall(r"[a-z0-9]+", text_lower))
-
-    def _word_set(s: str) -> set[str]:
-        """Returns the set of alphanumeric tokens in a string."""
-        return set(re.findall(r"[a-z0-9]+", s.lower()))
-
-    # Precompute word sets for all allowed entities once
-    allowed_skill_wordsets = [_word_set(s) for s in allowed_skills]
-    allowed_co_wordsets = [_word_set(c) for c in allowed_companies]
-
-    # List of all known skills in the dataset
-    all_known_skills = [
-        "langchain", "llamaindex", "pinecone", "weaviate", "qdrant", "milvus",
-        "opensearch", "elasticsearch", "faiss", "python", "pytorch", "tensorflow",
-        "scikit-learn", "numpy", "pandas", "lora", "qlora", "peft", "xgboost",
-        "nlp", "computer vision", "opencv", "cnn", "yolo", "gans", "diffusion models"
-    ]
-
-    for s in all_known_skills:
-        s_words = _word_set(s)
-        # Only flag if ALL words of the known skill token appear in the text
-        if s_words.issubset(text_words):
-            # Pass if any allowed skill shares all those words (whole-word overlap)
-            if not any(s_words.issubset(aws) or aws.issubset(s_words) for aws in allowed_skill_wordsets):
-                return False
-
-    # List of known companies
-    known_cos = [
-        "apple", "amazon", "ola", "sarvam", "phonepe", "meta", "adobe", "google",
-        "tcs", "wipro", "infosys", "mindtree", "cognizant", "capgemini", "accenture",
-        "acme", "dunder mifflin", "globex", "initech", "wayne enterprises", "hooli",
-        "stark industries", "pied piper", "niramai", "locobuzz", "paytm", "unacademy",
-        "byju's", "vedantu", "flipkart", "swiggy", "zomato", "freshworks", "haptik",
-        "observe.ai", "saarthi.ai", "rephrase.ai", "razorpay", "meesho", "dream11"
-    ]
-
-    for c in known_cos:
-        c_words = _word_set(c)
-        # Only flag if ALL words of the known company token appear in the text
-        if c_words.issubset(text_words):
-            # Pass if any allowed company shares at least one word with the token
-            if not any(c_words & acw for acw in allowed_co_wordsets):
-                return False
-
-    return True
-
-
-# Maps specific skill names to broad, grounding-safe category labels.
-def _skill_to_category(skill: str) -> str:
-    s = skill.lower()
-    if any(x in s for x in ["vector", "faiss", "pinecone", "qdrant", "weaviate", "milvus", "opensearch", "elasticsearch"]):
-        return "vector/search infrastructure"
-    if any(x in s for x in ["embeddings", "sentence-transformer", "semantic"]):
-        return "embedding systems"
-    if any(x in s for x in ["lora", "qlora", "peft", "fine-tun", "finetun"]):
-        return "LLM fine-tuning"
-    if any(x in s for x in ["ranking", "ndcg", "learning to rank", "lambdamart", "xgboost", "lgbm"]):
-        return "learning-to-rank systems"
-    if any(x in s for x in ["nlp", "transformers", "bert", "gpt"]):
-        return "NLP / transformer models"
-    if any(x in s for x in ["recommendation", "recsys"]):
-        return "recommendation systems"
-    if any(x in s for x in ["retrieval", "bm25", "hybrid search"]):
-        return "information retrieval"
-    if any(x in s for x in ["mlops", "deployment", "serving", "triton", "kubernetes", "docker"]):
-        return "ML deployment / MLOps"
-    return "applied ML"
-
-
-# Checks if the generated text contains any first-person markers.
-def is_first_person(text: str) -> bool:
-    first_person_markers = {"i am", "i have", "my experience", "i've", "i work", "myself", "my background"}
-    text_lower = text.lower()
-    return any(marker in text_lower for marker in first_person_markers)
-
-
-# Checks if the generated text contains any non-English characters.
-def has_non_english(text: str) -> bool:
-    for c in text:
-        o = ord(c)
-        if o > 127:
-            # Allow common unicode punctuation/dashes/quotes (general punctuation range 0x2000-0x206F)
-            if not (0x2000 <= o <= 0x206F):
-                return True
-    return False
-
-
-# Checks if the reasoning text contains concern or hedging language for rank > 20.
-def has_concern_hedge(text: str, rank: int, gap: str) -> bool:
-    if rank <= 20:
-        return True
-    text_lower = text.lower()
-    hedging_markers = {
-        "but", "however", "lacks", "lack", "does not yet"
-    }
-    return any(h in text_lower for h in hedging_markers)
-
-
-# Extracts the hedging clause from the generated candidate reasoning text.
-def extract_hedge_clause(text: str) -> str:
-    text_lower = text.lower()
-    splitters = ["but", "however", "does not yet", "lacks", "though", "yet"]
-    for splitter in splitters:
-        if splitter in text_lower:
-            return text_lower.split(splitter, 1)[1].strip()
-    return text_lower
-
-
-# Computes the sequence matcher similarity ratio between two strings.
-def get_similarity(a: str, b: str) -> float:
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-JD_REQUIREMENT_LABELS = {
-    "semantic_sim_to_ideal": "production-scale search/retrieval experience",
-    "semantic_sim_to_jd": "NLP/retrieval systems expertise",
-    "years_of_experience": "senior-level professional experience",
-    "no_recent_coding": "recent hands-on coding",
-    "is_consulting_only": "product company experience",
-    "is_pure_research": "shipped production ML systems",
-    "no_external_validation": "external validation (OSS/publications)",
-    "cv_speech_robotics_no_nlp": "NLP/information retrieval background",
-    "is_recent_wrapper_only": "pre-LLM ML/AI core foundation",
-    "behavioral_score": "recruiter response and platform activity",
-    "notice_period_penalty": "JD-preferred notice period",
-    "bm25_score": "keyword/search systems expertise",
-}
-
-
-# Loads the ranker model coefficients to determine feature contributions.
-def _get_ranker_coefs() -> dict[str, float]:
-    model_path = Path("artifacts/ranker_model.pkl")
-    if model_path.exists():
-        try:
-            import pickle
-            with open(model_path, "rb") as f:
-                payload = pickle.load(f)
-            model = payload["model"]
-            feature_names = payload["feature_names"]
-            if hasattr(model, "coef_"):
-                return dict(zip(feature_names, model.coef_))
-        except Exception:
-            pass
-    return {
-        'years_of_experience': -0.17003386, 'n_skills': 0.08163438, 'is_consulting_only': -0.00333992,
-        'is_pure_research': 0.0, 'is_recent_wrapper_only': 0.0, 'no_recent_coding': -0.75688456,
-        'cv_speech_robotics_no_nlp': -0.24919117, 'no_external_validation': -0.6123869,
-        'title_chasing_pattern': 0.0405579, 'framework_enthusiast_signal': -0.22621816,
-        'behavioral_score': 1.59216212, 'notice_period_penalty': 0.16015115,
-        'skill_to_experience_ratio': -0.21268627, 'semantic_sim_to_jd': -0.86485791,
-        'semantic_sim_to_ideal': 2.396714, 'bm25_score': 0.00388941
-    }
-
-
-def generate_looser_reasoning(
-    model, tokenizer,
-    yoe: float, title: str, company: str, rank: int, gap: str,
-    matched_skills: list[str], past_roles: str, jd_label: str
-) -> str:
-    # Convert specific skill names to safe category labels
-    skill_categories = list(dict.fromkeys(_skill_to_category(s) for s in matched_skills[:4]))
-    skills_summary = ", ".join(skill_categories[:2]) if skill_categories else "applied ML systems"
-
-    if rank <= 20:
-        facts = (
-            f"- Current role: {title} at {company}\n"
-            f"- Skill areas: {skills_summary}\n"
-            f"- Past roles: {past_roles}\n"
-            f"- Rank: #{rank} of 100\n"
-            f"- Strongest match to role: {jd_label}"
-        )
-        messages = [
-            {"role": "system", "content": (
-                "You are a professional recruiting assistant. Write exactly ONE complete sentence (under 18 words) "
-                "summarising this candidate's fit for a Senior AI/ML Engineer role, using the facts below. "
-                "GOOD example: '7 years at Google building large-scale retrieval, directly matching the role's need for production search systems.' "
-                "BAD example: '7 years of experience at Google, skilled in FAISS.' "
-                "Reference the strongest match to the role in your sentence to show how it connects to the JD requirement. "
-                "Do NOT copy skill tool names verbatim. Do NOT mention any company not listed below."
-            )},
-            {"role": "user", "content": f"Facts:\n{facts}\n\nOutput one complete sentence ending with a period."}
-        ]
-    else:
-        facts = (
-            f"- Current role: {title} at {company}\n"
-            f"- Skill areas: {skills_summary}\n"
-            f"- Past roles: {past_roles}\n"
-            f"- Rank: #{rank} of 100\n"
-            f"- Concern: {gap}\n"
-            f"- JD requirement gap: {jd_label}"
-        )
-        messages = [
-            {"role": "system", "content": (
-                "You are a professional recruiting assistant. Write exactly ONE complete sentence (under 22 words) "
-                "summarising this candidate's fit for a Senior AI/ML Engineer role, weaving in a description of the "
-                "specific concern below in your own words — do NOT copy the concern phrase verbatim. "
-                "GOOD example: '7 years at Google building large-scale retrieval, directly matching the role's need for production search systems.' "
-                "BAD example: '7 years of experience at Google, skilled in FAISS.' "
-                "Connect the concern to the JD requirement gap in your sentence. "
-                "Do NOT copy skill tool names verbatim. Do NOT mention any company not listed below."
-            )},
-            {"role": "user", "content": f"Facts:\n{facts}\n\nRules:\n1. Output exactly one complete sentence ending with a period.\n2. You MUST explicitly state the concern and connect it to the JD requirement gap. Do NOT write a positive-only sentence."}
-        ]
-        
-    with torch.no_grad():
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        model_inputs = tokenizer([text], return_tensors="pt").to("cpu")
-        generated_ids = model.generate(
-            model_inputs.input_ids,
-            max_new_tokens=40,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        
-    if not response.endswith((".", "!", "?")):
-        matches = list(re.finditer(r'[.!?](?:\s|$)', response))
-        if matches:
-            last_punc_idx = matches[-1].start()
-            response = response[:last_punc_idx + 1]
-        else:
-            response = response + "."
-            
-
-
-
-# Generates reasoning statements for the final 100 candidates.
-def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
-    torch.set_num_threads(8)
-    model, tokenizer = _get_model_and_tokenizer()
+    yoe = float(row.get("years_of_experience", 0.0))
+    semantic_match = float(row.get("semantic_sim_to_ideal", 0.5))
+    behavior_score = float(row.get("behavioral_score", 0.5))
+    notice_days = float(row.get("redrob_notice_period_days", 0.0))
     
-    # Configure padding for batched generation
-    tokenizer.padding_side = "left"
-    tokenizer.pad_token = tokenizer.eos_token
+    has_recent_coding = float(row.get("no_recent_coding", 0.0)) == 0.0
+    consulting_only = float(row.get("is_consulting_only", 0.0)) == 1.0
     
-    # Define JD key skills
-    jd_skills = {
-        "sentence-transformers", "embeddings", "vector search", "hybrid search", 
-        "pinecone", "weaviate", "qdrant", "milvus", "opensearch", "elasticsearch", 
-        "faiss", "python", "ndcg", "mrr", "map", "a/b testing", "lora", "qlora", 
-        "peft", "learning to rank", "xgboost", "neural ranking", "hr-tech", 
-        "distributed systems", "nlp", "information retrieval"
-    }
-
-    # Pre-parse and set up candidate contexts
-    candidates = []
-    for idx, (_, row) in enumerate(candidates_df.iterrows()):
-        yoe = row["years_of_experience"]
-        title = row["current_title"]
-        company = row["current_company"]
-        rank = int(row["rank"])
-        
-        # Parse skills
-        try:
-            skills_list = [s["name"] for s in json.loads(row["skills_json"])]
-        except (json.JSONDecodeError, TypeError, KeyError):
-            skills_list = []
-            
-        # Add domain-specific skills found in job titles to the allowed list to prevent title-based grounding failures
-        title_skills = []
-        all_known_skills = [
-            "langchain", "llamaindex", "pinecone", "weaviate", "qdrant", "milvus",
-            "opensearch", "elasticsearch", "faiss", "python", "pytorch", "tensorflow",
-            "scikit-learn", "numpy", "pandas", "lora", "qlora", "peft", "xgboost",
-            "nlp", "computer vision", "opencv", "cnn", "yolo", "gans", "diffusion models"
-        ]
-        
-        # Parse career
-        try:
-            career_list = json.loads(row["career_history_json"])
-        except (json.JSONDecodeError, TypeError):
-            career_list = []
-
-        for t in [title] + [c.get("title") for c in career_list if c.get("title")]:
-            t_lower = t.lower()
-            for s in list(jd_skills) + all_known_skills:
-                if s.lower() in t_lower:
-                    title_skills.append(s)
-        skills_list.extend(title_skills)
-        
-        matched_skills = [s for s in skills_list if s.lower() in jd_skills or any(x in s.lower() for x in ["embeddings", "vector", "search", "ranking", "eval", "llm", "finetun", "fine-tun", "nlp", "retrieval"])]
-        if not matched_skills:
-            matched_skills = skills_list[:5]
-            
-        roles = []
-        companies = [company]
-        for c in career_list[:2]:
-            roles.append(f"{c.get('title')} at {c.get('company')} ({c.get('duration_months', 0)} months)")
-            if c.get("company"):
-                companies.append(c.get("company"))
-        relevant_career = "; ".join(roles)
-        days = row["redrob_notice_period_days"]
-        
-        # 1. Define fully resolved descriptions for all features (hyper-specific to Senior AI Engineer JD)
-        JD_REQUIREMENT_DESCRIPTIONS = {
-            "semantic_sim_to_ideal": {
-                "strength": "strong alignment with the ideal senior AI/search engineer archetype (applied ML, search/retrieval at product companies)",
-                "gap": "profile narrative does not closely match the ideal senior AI/search engineer archetype (applied ML, search/retrieval at product companies)"
-            },
-            "semantic_sim_to_jd": {
-                "strength": "excellent alignment with the JD's NLP and retrieval systems requirements",
-                "gap": "limited specific alignment with the JD's NLP and retrieval systems requirements"
-            },
-            "years_of_experience": {
-                "strength": lambda val: f"senior-level professional experience of {val:.1f} years, matching the JD's target of 6-8 years total experience (with 4-5 years in applied ML/AI roles)",
-                "gap": lambda val: f"only {val:.1f} years of experience, below the JD's target of 6-8 years total experience" if val < 6.0 else f"{val:.1f} years of experience without matching seniority markers (open-source / publications)"
-            },
-            "no_recent_coding": {
-                "strength": "active hands-on coding role in recent months",
-                "gap": "has not written production code in the last 18 months"
-            },
-            "is_consulting_only": {
-                "strength": "valuable product company experience",
-                "gap": "career has been entirely at consulting firms with no product company experience"
-            },
-            "is_pure_research": {
-                "strength": "strong experience shipping production systems",
-                "gap": "comes from a pure research background with no shipped production systems"
-            },
-            "no_external_validation": {
-                "strength": "external validation via open-source projects, talks, or publications",
-                "gap": "lacks external validation via open-source projects, talks, or publications"
-            },
-            "cv_speech_robotics_no_nlp": {
-                "strength": "strong NLP and information retrieval background",
-                "gap": "background is in computer vision, speech, or robotics without significant NLP or IR exposure"
-            },
-            "is_recent_wrapper_only": {
-                "strength": "substantial pre-LLM-era ML production experience and a solid core ML/AI foundation",
-                "gap": "recent AI experience consists primarily of wrapper projects using API calls (using LangChain) under 12 months, lacking substantial pre-LLM ML/AI core foundation"
-            },
-            "behavioral_score": {
-                "strength": "high platform activity and recruiter response rate",
-                "gap": "low recent platform activity and recruiter response rate on the platform"
-            },
-            "notice_period_penalty": {
-                "strength": lambda val: "short notice period (sub-30-day notice, no buyout required)",
-                "gap": lambda val: f"notice period of {int(val)} days is longer than the JD's preferred sub-30-day notice"
-            },
-            "bm25_score": {
-                "strength": "strong keywords matching search systems expertise",
-                "gap": "limited keyword alignment with search systems expertise"
-            }
-        }
-
-        # Gap logic mapping to JD label
-        gap = None
-        jd_label = None
-        if row.get("no_recent_coding") == 1.0:
-            gap = JD_REQUIREMENT_DESCRIPTIONS["no_recent_coding"]["gap"]
-            jd_label = JD_REQUIREMENT_LABELS["no_recent_coding"]
-        elif row.get("is_consulting_only") == 1.0:
-            gap = JD_REQUIREMENT_DESCRIPTIONS["is_consulting_only"]["gap"]
-            jd_label = JD_REQUIREMENT_LABELS["is_consulting_only"]
-        elif row.get("cv_speech_robotics_no_nlp") == 1.0:
-            gap = JD_REQUIREMENT_DESCRIPTIONS["cv_speech_robotics_no_nlp"]["gap"]
-            jd_label = JD_REQUIREMENT_LABELS["cv_speech_robotics_no_nlp"]
-        elif row.get("is_pure_research") == 1.0:
-            gap = JD_REQUIREMENT_DESCRIPTIONS["is_pure_research"]["gap"]
-            jd_label = JD_REQUIREMENT_LABELS["is_pure_research"]
-        elif row.get("notice_period_penalty", 0.0) > 0.0 and pd.notna(days) and days > 30:
-            gap = JD_REQUIREMENT_DESCRIPTIONS["notice_period_penalty"]["gap"](days)
-            jd_label = JD_REQUIREMENT_LABELS["notice_period_penalty"]
-        
-        if gap is None:
-            sem_ideal = float(row.get("semantic_sim_to_ideal", 1.0))
-            beh = float(row.get("behavioral_score", 1.0))
-            yoe_val = float(yoe)
-            if yoe_val < 6.0:
-                gap = JD_REQUIREMENT_DESCRIPTIONS["years_of_experience"]["gap"](yoe_val)
-                jd_label = JD_REQUIREMENT_LABELS["years_of_experience"]
-            elif yoe_val > 9.0:
-                gap = JD_REQUIREMENT_DESCRIPTIONS["years_of_experience"]["gap"](yoe_val)
-                jd_label = JD_REQUIREMENT_LABELS["years_of_experience"]
-            elif sem_ideal < 0.45:
-                gap = JD_REQUIREMENT_DESCRIPTIONS["semantic_sim_to_ideal"]["gap"]
-                jd_label = JD_REQUIREMENT_LABELS["semantic_sim_to_ideal"]
-            elif beh < 0.45:
-                gap = JD_REQUIREMENT_DESCRIPTIONS["behavioral_score"]["gap"]
-                jd_label = JD_REQUIREMENT_LABELS["behavioral_score"]
-            elif sem_ideal < 0.55:
-                gap = "moderate alignment with the ideal candidate narrative, with room to grow into a senior scope"
-                jd_label = "production-scale search/retrieval experience"
-            else:
-                gap = "does not yet demonstrate the end-to-end system ownership this senior role requires"
-                jd_label = "production-scale search/retrieval experience"
-            
-        if rank <= 20:
-            coefs = _get_ranker_coefs()
-            contributions = {}
-            for feat, coef in coefs.items():
-                val = float(row.get(feat, 0.0))
-                contributions[feat] = val * coef
-                
-            penalty_features = {"notice_period_penalty", "no_recent_coding", "is_consulting_only", "no_external_validation", "is_recent_wrapper_only", "cv_speech_robotics_no_nlp"}
-            valid_feats = []
-            for feat in JD_REQUIREMENT_LABELS.keys():
-                if feat in contributions:
-                    val = float(row.get(feat, 0.0))
-                    if feat in penalty_features:
-                        if val == 0.0:
-                            valid_feats.append(feat)
-                    else:
-                        valid_feats.append(feat)
-                        
-            if not valid_feats:
-                valid_feats = ["semantic_sim_to_ideal"]
-                
-            best_feat = max(valid_feats, key=lambda f: contributions[f])
-            jd_label = JD_REQUIREMENT_LABELS[best_feat]
-            
-            desc_entry = JD_REQUIREMENT_DESCRIPTIONS[best_feat]["strength"]
-            if callable(desc_entry):
-                if best_feat == "years_of_experience":
-                    strength_desc = desc_entry(yoe_val)
-                elif best_feat == "notice_period_penalty":
-                    strength_desc = desc_entry(days)
-                else:
-                    strength_desc = desc_entry(row.get(best_feat, 0.0))
-            else:
-                strength_desc = desc_entry
-            
-            notice_str = "sub-30-day notice, no buyout needed" if (pd.notna(days) and days <= 30) else f"{int(days)}-day notice" if pd.notna(days) else "no notice period penalty"
-            facts_str = f"Facts:\n- Role: {title} at {company}\n- Skills: {', '.join(matched_skills[:3])}\n- Past: {relevant_career}\n- Notice: {notice_str}\n- Strongest match to role: {strength_desc}"
-            rules_str = (
-                "Rules:\n"
-                "1. Output exactly one complete sentence ending with a period.\n"
-                "2. Reference the strongest match to the role in your sentence to show how it connects to the JD requirement.\n"
-                "3. Use ONLY the listed skills and companies above."
-            )
-        else:
-            facts_str = f"Facts:\n- Role: {title} at {company}\n- Skills: {', '.join(matched_skills[:3])}\n- Past: {relevant_career}\n- Concern: {gap}\n- JD requirement gap: {jd_label}"
-            rules_str = (
-                "Rules:\n"
-                f"1. MOST IMPORTANT: Your sentence MUST explicitly state the concern above and connect it to the JD requirement gap: {jd_label} using a contrast word like 'but' or 'however'. Do NOT write a positive-only sentence.\n"
-                "2. Output exactly one complete sentence ending with a period.\n"
-                "3. Use ONLY the listed skills and companies above."
-            )
-            
-        allowed_numbers = ["30", "18", "12"]
-        if pd.notna(days):
-            allowed_numbers.append(str(int(days)))
-        allowed_numbers.extend(["6", "8", "4", "5", "9"])
-        yoe_val = float(yoe)
-        allowed_numbers.append(f"{yoe_val:.1f}")
-        allowed_numbers.append(str(int(yoe_val)))
-        for c in career_list:
-            if c.get("duration_months"):
-                allowed_numbers.append(str(c["duration_months"]))
-        cand_allowed_numbers = list(set(allowed_numbers))
-        
-        candidates.append({
-            "idx": idx,
-            "candidate_id": row["candidate_id"],
-            "rank": rank,
-            "yoe": yoe,
-            "title": title,
-            "company": company,
-            "gap": gap,
-            "jd_label": jd_label,
-            "matched_skills": matched_skills,
-            "relevant_career": relevant_career,
-            "allowed_skills": skills_list,
-            "allowed_cos": list(set(companies)),
-            "allowed_numbers": cand_allowed_numbers,
-            "days": days,
-            "facts_str": facts_str,
-            "rules_str": rules_str,
-        })
-
-    # Output storage
-    reasonings = [None] * len(candidates)
-    accepted_reasonings = []
-    accepted_hedges = []
+    # Check open source and publication cues in the narrative
+    open_source = any(x in narrative for x in ["open source", "oss", "github", "contributions"])
+    publications = any(x in narrative for x in ["publication", "paper", "patent", "thesis"])
+    leadership = _check_leadership(title)
     
-    # Helper to generate a batch of prompts
-    def generate_batch(batch_candidates, temp, do_sample, system_prompt):
-        texts = []
-        for cand in batch_candidates:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{cand['facts_str']}\n\n{cand['rules_str']}"}
-            ]
-            texts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
-            
-        inputs = tokenizer(texts, padding=True, return_tensors="pt").to("cpu")
-        gen_kwargs = {
-            "max_new_tokens": 64,
-            "do_sample": do_sample,
-            "pad_token_id": tokenizer.eos_token_id
-        }
-        if do_sample:
-            gen_kwargs["temperature"] = temp
-            
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **inputs,
-                **gen_kwargs
-            )
-        
-        responses = []
-        for i in range(len(batch_candidates)):
-            input_len = len(inputs.input_ids[i])
-            resp_ids = generated_ids[i][input_len:]
-            resp = tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
-            responses.append(resp)
-        return responses
-        
-    # --- ROUND 1: Attempt 1 ---
-    import time
-    llm_start_time = time.time()
-    print("--- Running reasoning Round 1 (Attempt 1) in batches of 50 ---")
-    batch_size = 50
-    round1_candidates = candidates.copy()
-    round1_responses = []
-    system_primary = (
-        "You are a professional recruiting assistant. Summarize this candidate's fit in exactly one short, complete sentence (under 20 words) using ONLY the verified facts. Do not assume or invent anything. "
-        "GOOD example: '7 years at Google building large-scale retrieval, directly matching the role's need for production search systems.' "
-        "BAD example: '7 years of experience at Google, skilled in FAISS.'"
+    return CandidateAnalysis(
+        candidate_id=row["candidate_id"],
+        yoe=yoe,
+        title=title,
+        company=company,
+        semantic_match=semantic_match,
+        behavior_score=behavior_score,
+        notice_days=notice_days,
+        has_recent_coding=has_recent_coding,
+        consulting_only=consulting_only,
+        open_source=open_source,
+        publications=publications,
+        leadership=leadership,
     )
+
+
+# Evaluates candidate features against thresholds to determine planned reasons, tone, confidence, and evidence.
+def plan_reason(analysis: CandidateAnalysis, next_analysis: CandidateAnalysis | None) -> ReasonPlan:
+    # 1. Persona Classification
+    if analysis.yoe >= 5.0 and analysis.semantic_match >= 0.58 and analysis.behavior_score >= 0.70 and analysis.notice_days <= 30:
+        persona = "Elite Match"
+    elif analysis.has_recent_coding is False or analysis.behavior_score < 0.55 or analysis.notice_days > 90:
+        persona = "High Risk"
+    elif analysis.yoe >= 4.0 and not analysis.consulting_only and analysis.semantic_match >= 0.55 and analysis.has_recent_coding:
+        persona = "Strong Product Engineer"
+    elif analysis.yoe >= 7.0 and analysis.semantic_match >= 0.55:
+        persona = "Senior Specialist"
+    elif analysis.leadership and analysis.yoe >= 5.0:
+        persona = "Leadership Profile"
+    elif analysis.publications:
+        persona = "Research-Oriented"
+    elif analysis.notice_days <= 15 or (analysis.notice_days <= 30 and analysis.behavior_score >= 0.70):
+        persona = "Fast Hire"
+    elif analysis.consulting_only:
+        persona = "Consulting Background"
+    elif analysis.yoe < 4.0 and analysis.semantic_match >= 0.53:
+        persona = "Emerging Candidate"
+    else:
+        persona = "Backend Generalist"
+
+    # 2. Primary Reason Selection
+    if analysis.semantic_match >= 0.58:
+        primary_reason = "Exceptional JD alignment"
+    elif not analysis.consulting_only and analysis.yoe >= 5.0:
+        primary_reason = "Strong production engineering background"
+    elif analysis.leadership and analysis.yoe >= 5.0:
+        primary_reason = "Technical leadership"
+    elif analysis.notice_days <= 15:
+        primary_reason = "Hiring readiness"
+    elif analysis.consulting_only:
+        primary_reason = "Relevant experience with delivery-focused background"
+    else:
+        primary_reason = "Core ML/AI technical competence"
+
+    # 3. Secondary Reason Selection
+    if analysis.yoe >= 7.0:
+        secondary_reason = "years of experience"
+    elif analysis.company.lower() in ["google", "apple", "microsoft", "amazon", "netflix", "adobe", "meta", "salesforce"]:
+        secondary_reason = "top-tier company pedigree"
+    elif analysis.has_recent_coding:
+        secondary_reason = "active hands-on coding"
+    elif analysis.open_source:
+        secondary_reason = "open source contributions"
+    elif analysis.publications:
+        secondary_reason = "research publications"
+    elif analysis.behavior_score >= 0.70:
+        secondary_reason = "high recruiter responsiveness"
+    else:
+        secondary_reason = "solid candidate engagement"
+
+    # 4. Concern Selection
+    if not analysis.has_recent_coding:
+        concern = "Lack of recent coding"
+    elif analysis.notice_days > 30:
+        concern = "Long notice period"
+    elif analysis.consulting_only:
+        concern = "Consulting-heavy experience"
+    elif analysis.semantic_match < 0.55:
+        concern = "Lower semantic alignment"
+    elif not analysis.open_source and not analysis.publications and analysis.yoe >= 5.0:
+        concern = "Missing external validation"
+    else:
+        concern = None
+
+    # 5. Tone Classification
+    if persona == "Elite Match":
+        tone = "Outstanding"
+    elif persona in ["Strong Product Engineer", "Senior Specialist", "Leadership Profile"] and concern is None:
+        tone = "Strong"
+    elif concern is None:
+        tone = "Positive"
+    elif persona == "High Risk":
+        tone = "Weak"
+    elif analysis.notice_days > 60 or not analysis.has_recent_coding:
+        tone = "Cautious"
+    else:
+        tone = "Balanced"
+
+    # 6. Confidence Classification
+    if analysis.semantic_match >= 0.57 and analysis.yoe >= 5.0 and analysis.notice_days <= 30:
+        confidence = "High"
+    elif persona == "High Risk" or (analysis.semantic_match < 0.52 and analysis.notice_days > 60):
+        confidence = "Low"
+    else:
+        confidence = "Medium"
+
+    # 7. Evidence Selection (2 to 4 items)
+    evidence = [
+        f"{analysis.yoe:.1f} years",
+        f"{analysis.title} at {analysis.company}",
+    ]
+    if analysis.semantic_match >= 0.55:
+        evidence.append(f"strong search systems background ({analysis.semantic_match:.2%})")
+    if analysis.open_source:
+        evidence.append("active GitHub presence")
+    if analysis.publications:
+        evidence.append("academic publication track record")
+    if analysis.behavior_score >= 0.70:
+        evidence.append("high recruiter responsiveness")
+
+    # 8. Relative Differentiator Awareness
+    differentiator = None
+    if next_analysis is not None:
+        if analysis.notice_days < next_analysis.notice_days - 15:
+            differentiator = "shorter hiring timeline"
+        elif analysis.semantic_match > next_analysis.semantic_match + 0.02:
+            differentiator = "closer semantic match to search requirements"
+        elif analysis.behavior_score > next_analysis.behavior_score + 0.05:
+            differentiator = "higher platform engagement"
+        elif analysis.yoe > next_analysis.yoe + 2.0:
+            differentiator = "greater professional experience"
+        elif analysis.has_recent_coding and not next_analysis.has_recent_coding:
+            differentiator = "active hands-on coding role"
+        elif not analysis.consulting_only and next_analysis.consulting_only:
+            differentiator = "product company background"
+
+    return ReasonPlan(
+        candidate_id=analysis.candidate_id,
+        persona=persona,
+        primary_reason=primary_reason,
+        secondary_reason=secondary_reason,
+        concern=concern,
+        tone=tone,
+        confidence=confidence,
+        evidence=evidence,
+        differentiator=differentiator,
+    )
+
+
+# Generates a natural language recruiter-style summary based solely on the ReasonPlan details.
+def generate_summary_from_plan(plan: ReasonPlan) -> str:
+    # Seed deterministic choices based on candidate_id hash
+    seed = int(hashlib.md5(plan.candidate_id.encode()).hexdigest(), 16) % 100
     
-    for i in range(0, len(round1_candidates), batch_size):
-        batch = round1_candidates[i:i+batch_size]
-        resps = generate_batch(batch, temp=0.1, do_sample=False, system_prompt=system_primary)
-        round1_responses.extend(resps)
-        print(f"  Processed Round 1: {i + len(batch)}/100")
- 
-    # Evaluate Round 1 in order of rank
-    pending_candidates = []
-    for cand, resp in zip(round1_candidates, round1_responses):
-        idx = cand["idx"]
-        is_grounded = verify_grounding(resp, cand["allowed_skills"], cand["allowed_cos"])
-        is_first_pers = is_first_person(resp)
-        has_non_eng = has_non_english(resp)
-        has_hedge = has_concern_hedge(resp, cand["rank"], cand["gap"])
+    yoe_desc = plan.evidence[0]
+    role_desc = plan.evidence[1]
+    
+    # Extra strengths
+    extra_strengths = plan.evidence[2:] if len(plan.evidence) > 2 else []
+    strength_phrase = f" and {extra_strengths[0]}" if extra_strengths else ""
+    
+    differentiator_clause = f" They stand out with a {plan.differentiator} compared to adjacent candidates." if plan.differentiator else ""
+    concern_clause = f" However, hiring is constrained by {plan.concern.lower()}." if plan.concern else ""
+    
+    # Define starter strings by persona
+    if plan.persona == "Elite Match":
+        starters = [
+            f"An outstanding fit for the role. Brings {yoe_desc} as a {role_desc}{strength_phrase}.",
+            f"Evaluated as an elite candidate, offering {yoe_desc} as a {role_desc}{strength_phrase}.",
+            f"A premier profile matching all requirements, presenting {yoe_desc} at {role_desc.split(' at ')[1]}."
+        ]
+        sentence = starters[seed % len(starters)] + differentiator_clause
         
-        stripped = resp.strip()
-        ends_with_punc = len(stripped) > 0 and stripped[-1] in {'.', '!', '?'}
+    elif plan.persona == "Strong Product Engineer":
+        starters = [
+            f"A strong product systems builder with {yoe_desc} as a {role_desc}.",
+            f"Brings robust product engineering experience, offering {yoe_desc} as a {role_desc}."
+        ]
+        sentence = starters[seed % len(starters)] + f" They demonstrate {plan.primary_reason.lower()}{strength_phrase}.{concern_clause}"
         
-        hedge_clause = extract_hedge_clause(resp)
-        is_too_similar = False
-        if cand["rank"] > 20:
-            for prev_resp in accepted_reasonings:
-                if get_similarity(resp.lower(), prev_resp.lower()) > 0.70:
-                    is_too_similar = True
-                    break
-            if not is_too_similar:
-                is_notice = "notice" in hedge_clause.lower()
-                thresh = 0.82 if is_notice else 0.60
-                for prev_hedge in accepted_hedges:
-                    if get_similarity(hedge_clause, prev_hedge) > thresh:
-                        is_too_similar = True
-                        break
-                    
-        is_num_grounded = verify_number_grounding(resp, cand["allowed_numbers"])
-        is_notice_ok = not has_notice_hallucination(resp, cand["days"])
+    elif plan.persona == "Senior Specialist":
+        starters = [
+            f"A seasoned specialist bringing {yoe_desc} of deep expertise, currently {role_desc}.",
+            f"Offers {yoe_desc} of senior technical experience, holding a {role_desc} role."
+        ]
+        sentence = starters[seed % len(starters)] + f" Highly aligned due to {plan.primary_reason.lower()}.{concern_clause}"
         
-        if is_grounded and is_num_grounded and is_notice_ok and not is_first_pers and not has_non_eng and has_hedge and ends_with_punc and not is_too_similar:
-            reasonings[idx] = resp
-            accepted_reasonings.append(resp)
-            accepted_hedges.append(hedge_clause)
-        else:
-            pending_candidates.append(cand)
+    elif plan.persona == "Leadership Profile":
+        starters = [
+            f"Brings valuable technical leadership experience, currently a {role_desc}.",
+            f"A lead engineer with {yoe_desc} of experience, currently working at {role_desc.split(' at ')[1]}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Positioned well due to {plan.primary_reason.lower()}{strength_phrase}.{concern_clause}"
+        
+    elif plan.persona == "Research-Oriented":
+        starters = [
+            f"A research-focused engineer with {yoe_desc} at {role_desc.split(' at ')[1]}.",
+            f"Supported by strong academic/research credentials, they bring {yoe_desc} as a {role_desc}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Demonstrates {plan.secondary_reason}.{concern_clause}"
+        
+    elif plan.persona == "Fast Hire":
+        starters = [
+            f"A highly active candidate available immediately, bringing {yoe_desc} as a {role_desc}.",
+            f"Ready for fast onboarding, they offer {yoe_desc} of experience at {role_desc.split(' at ')[1]}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Strengths include {plan.secondary_reason}.{concern_clause}"
+        
+    elif plan.persona == "Consulting Background":
+        starters = [
+            f"Brings a delivery-focused background with {yoe_desc} as a {role_desc}.",
+            f"An experienced systems delivery specialist offering {yoe_desc} as a {role_desc}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Positioned as a consulting resource with {plan.primary_reason.lower()}.{concern_clause}"
+        
+    elif plan.persona == "Emerging Candidate":
+        starters = [
+            f"An emerging technical talent bringing {yoe_desc} of experience, currently {role_desc}.",
+            f"A high-potential ML engineer offering {yoe_desc} as a {role_desc}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Highlights include {plan.secondary_reason}.{concern_clause}"
+        
+    elif plan.persona == "High Risk":
+        starters = [
+            f"A candidate holding a {role_desc} role with {yoe_desc}.",
+            f"Brings {yoe_desc} of experience, currently in a {role_desc} role."
+        ]
+        # Always emphasize concern for high risk
+        concern_str = plan.concern.lower() if plan.concern else "lower overall feature scores"
+        sentence = starters[seed % len(starters)] + f" However, they present a key hiring risk due to {concern_str}."
+        
+    else:  # Backend Generalist or fallback
+        starters = [
+            f"Offers a solid generalist background with {yoe_desc} as a {role_desc}.",
+            f"Brings {yoe_desc} of technical experience, currently at {role_desc.split(' at ')[1]}."
+        ]
+        sentence = starters[seed % len(starters)] + f" Positioned on the list with {plan.primary_reason.lower()}.{concern_clause}"
+        
+    # Clean up double spaces or minor punctuation anomalies
+    sentence = re.sub(r"\s+", " ", sentence).strip()
+    return sentence
 
-    # --- ROUND 2: Attempt 2 (Retry) ---
-    if pending_candidates:
-        print(f"\n--- Running reasoning Round 2 (Attempt 2) for {len(pending_candidates)} pending candidates in batches ---")
-        system_retry = (
-            "You are a professional recruiting assistant. Summarize this candidate's fit in exactly one short, complete sentence (under 20 words). You MUST strictly use ONLY the verified facts. Do not assume or invent anything. Do not mention any companies or skills not in the list below. "
-            "GOOD example: '7 years at Google building large-scale retrieval, directly matching the role's need for production search systems.' "
-            "BAD example: '7 years of experience at Google, skilled in FAISS.'"
-        )
-        round2_responses = []
-        for i in range(0, len(pending_candidates), batch_size):
-            batch = pending_candidates[i:i+batch_size]
-            resps = generate_batch(batch, temp=0.7, do_sample=True, system_prompt=system_retry)
-            round2_responses.extend(resps)
-            print(f"  Processed Round 2: {i + len(batch)}/{len(pending_candidates)}")
 
-        # Evaluate Round 2 in order of rank
-        still_pending = []
-        for cand, resp in zip(pending_candidates, round2_responses):
-            idx = cand["idx"]
-            is_grounded = verify_grounding(resp, cand["allowed_skills"], cand["allowed_cos"])
-            is_first_pers = is_first_person(resp)
-            has_non_eng = has_non_english(resp)
-            has_hedge = has_concern_hedge(resp, cand["rank"], cand["gap"])
-            
-            stripped = resp.strip()
-            ends_with_punc = len(stripped) > 0 and stripped[-1] in {'.', '!', '?'}
-            
-            hedge_clause = extract_hedge_clause(resp)
-            is_too_similar = False
-            if cand["rank"] > 20:
-                for prev_resp in accepted_reasonings:
-                    if get_similarity(resp.lower(), prev_resp.lower()) > 0.70:
-                        is_too_similar = True
-                        break
-                if not is_too_similar:
-                    is_notice = "notice" in hedge_clause.lower()
-                    thresh = 0.82 if is_notice else 0.60
-                    for prev_hedge in accepted_hedges:
-                        if get_similarity(hedge_clause, prev_hedge) > thresh:
-                            is_too_similar = True
-                            break
-                        
-            is_num_grounded = verify_number_grounding(resp, cand["allowed_numbers"])
-            is_notice_ok = not has_notice_hallucination(resp, cand["days"])
-            
-            if is_grounded and is_num_grounded and is_notice_ok and not is_first_pers and not has_non_eng and has_hedge and ends_with_punc and not is_too_similar:
-                reasonings[idx] = resp
-                accepted_reasonings.append(resp)
-                accepted_hedges.append(hedge_clause)
-            else:
-                still_pending.append(cand)
-        pending_candidates = still_pending
-
-    # --- ROUND 3: Fallback (Looser LLM call) ---
-    if pending_candidates:
-        print(f"\n--- Running fallback reasoning for {len(pending_candidates)} candidates in batches of 50 ---")
-        system_fallback_rank20 = (
-            "You are a professional recruiting assistant. Write exactly ONE complete sentence (under 18 words) "
-            "summarising this candidate's fit for a Senior AI/ML Engineer role. "
-            "Write strictly in the third person recruiter voice. Do NOT use first-person pronouns (I, my, me, myself). "
-            "GOOD example: '7 years at Google building large-scale retrieval, directly matching the role's need for production search systems.' "
-            "BAD example: '7 years of experience at Google, skilled in FAISS.' "
-            "Reference the strongest match to the role in your sentence to show how it connects to the JD requirement. "
-            "Do NOT copy skill tool names verbatim. Do NOT mention any company not listed below."
-        )
-        system_fallback_rank_other = (
-            "You are a professional recruiting assistant. Write exactly ONE complete sentence (under 22 words) "
-            "summarising this candidate's fit for a Senior AI/ML Engineer role. "
-            "Write strictly in the third person recruiter voice. Do NOT use first-person pronouns (I, my, me, myself). "
-            "You MUST use a contrast word like 'but' or 'however' to weave in the specific concern below. "
-            "GOOD example: '7 years at Google building large-scale retrieval, but lacks recent hands-on coding experience required by the role.' "
-            "BAD example: '7 years of experience at Google, skilled in FAISS.' "
-            "Connect the concern to the JD requirement gap in your sentence. "
-            "Note: A shorter notice period is preferred. If notice is longer than 30 days, frame it as a concern because it is longer than preferred. "
-            "Do NOT copy skill tool names verbatim. Do NOT mention any company not listed below."
-        )
+# Runs the 4-stage reasoning pipeline for the top candidates.
+def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
+    analyses = []
+    for _, row in candidates_df.iterrows():
+        analyses.append(analyze_candidate(row))
         
-        fallback_texts = []
-        for cand in pending_candidates:
-            skill_categories = list(dict.fromkeys(_skill_to_category(s) for s in cand["matched_skills"][:4]))
-            skills_summary = ", ".join(skill_categories[:2]) if skill_categories else "applied ML systems"
-            
-            if cand["rank"] <= 20:
-                facts = (
-                    f"- Current role: {cand['title']} at {cand['company']}\n"
-                    f"- Skill areas: {skills_summary}\n"
-                    f"- Past roles: {cand['relevant_career']}\n"
-                    f"- Strongest match to role: {cand['jd_label']}"
-                )
-                messages = [
-                    {"role": "system", "content": system_fallback_rank20},
-                    {"role": "user", "content": f"Facts:\n{facts}\n\nOutput one complete sentence ending with a period."}
-                ]
-            else:
-                facts = (
-                    f"- Current role: {cand['title']} at {cand['company']}\n"
-                    f"- Skill areas: {skills_summary}\n"
-                    f"- Past roles: {cand['relevant_career']}\n"
-                    f"- Concern: {cand['gap']}\n"
-                    f"- JD requirement gap: {cand['jd_label']}"
-                )
-                messages = [
-                    {"role": "system", "content": system_fallback_rank_other},
-                    {"role": "user", "content": f"Facts:\n{facts}\n\nRules:\n1. Output exactly one complete sentence ending with a period.\n2. You MUST use 'but' or 'however' to connect the concern to the JD requirement gap."}
-                ]
-            fallback_texts.append(tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True))
-            
-        fallback_responses = []
-        for i in range(0, len(fallback_texts), batch_size):
-            batch_texts = fallback_texts[i:i+batch_size]
-            inputs = tokenizer(batch_texts, padding=True, return_tensors="pt").to("cpu")
-            with torch.no_grad():
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=80,
-                    do_sample=False,
-                    pad_token_id=tokenizer.eos_token_id
-                )
-            for j in range(len(batch_texts)):
-                input_len = len(inputs.input_ids[j])
-                resp_ids = generated_ids[j][input_len:]
-                resp = tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
-                # Clean non-ASCII characters to keep the dynamic English output clean
-                resp = re.sub(r'[^\x00-\x7f]+', '', resp).strip()
-                if not resp.endswith((".", "!", "?")):
-                    matches = list(re.finditer(r'[.!?](?:\s|$)', resp))
-                    if matches:
-                        last_punc_idx = matches[-1].start()
-                        resp = resp[:last_punc_idx + 1]
-                    else:
-                        resp = resp + "."
-                fallback_responses.append(resp)
-            print(f"  Processed Fallback: {i + len(batch_texts)}/{len(pending_candidates)}")
-            
-        for cand, resp in zip(pending_candidates, fallback_responses):
-            idx = cand["idx"]
-            
-            counter = 1
-            while resp in accepted_reasonings or any(get_similarity(resp.lower(), r.lower()) > 0.85 for r in accepted_reasonings):
-                if counter == 1 and cand.get("company"):
-                    if resp.endswith("."):
-                        resp = resp[:-1] + f" during tenure at {cand['company']}."
-                    else:
-                        resp = resp + f" during tenure at {cand['company']}."
-                elif counter == 2 and cand.get("title"):
-                    if resp.endswith("."):
-                        resp = resp[:-1] + f" as {cand['title']}."
-                    else:
-                        resp = resp + f" as {cand['title']}."
-                else:
-                    if resp.endswith("."):
-                        resp = resp[:-1] + f" (Ref: {cand['candidate_id']})."
-                    else:
-                        resp = resp + f" (Ref: {cand['candidate_id']})."
-                counter += 1
-                if counter > 5:
-                    break
-                    
-            reasonings[idx] = resp
-            accepted_reasonings.append(resp)
-            accepted_hedges.append(extract_hedge_clause(resp))
-                
-    print(f"Time taken for LLM generation: {time.time() - llm_start_time:.2f}s")
+    reasonings = []
+    for idx, analysis in enumerate(analyses):
+        # Pairwise differentiator comparison with the adjacent next candidate (rank i+1)
+        next_analysis = analyses[idx + 1] if idx + 1 < len(analyses) else None
+        
+        # 1. Create Reason Plan (Core Intelligence)
+        plan = plan_reason(analysis, next_analysis)
+        
+        # 2. Run Natural Language Generator
+        summary = generate_summary_from_plan(plan)
+        reasonings.append(summary)
+        
     return reasonings
