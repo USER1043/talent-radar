@@ -6,7 +6,7 @@ colorTo: pink
 sdk: streamlit
 sdk_version: "1.45.1"
 python_version: "3.13"
-app_file: app/streamlit_app.py
+app_file: app/app.py
 pinned: false
 short_description: Visual explorer for AI/ML candidate rankings.
 ---
