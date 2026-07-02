@@ -30,6 +30,8 @@ def open_candidates(path: Path):
 
 # Main execution flow for online candidate ranking.
 def main():
+    import time
+    pipeline_start_time = time.time()
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidates", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
@@ -44,11 +46,13 @@ def main():
 
     print("Stage 1: Loading candidate IDs from candidates file...")
     active_ids = set()
+    import re
+    cid_re = re.compile(r'"candidate_id"\s*:\s*"(CAND_\d{7})"')
     with open_candidates(args.candidates) as f:
         for line in f:
-            line = line.strip()
-            if line:
-                active_ids.add(json.loads(line)["candidate_id"])
+            m = cid_re.search(line)
+            if m:
+                active_ids.add(m.group(1))
     print(f"Loaded {len(active_ids)} active candidate IDs.")
 
     print("Stage 2: Loading cached artifacts...")
@@ -114,6 +118,10 @@ def main():
     feat_id_to_idx = {cid: idx for idx, cid in enumerate(df_feat["candidate_id"])}
     feats_df["bm25_score"] = [bm25_all_scores[feat_id_to_idx[cid]] for cid in shortlist_df["candidate_id"]]
 
+    # Assign features back to shortlist_df for use downstream in reasoning.py
+    for col in feats_df.columns:
+        shortlist_df[col] = feats_df[col].values
+
     print("Stage 6: Scoring candidates with trained ranker...")
     with open(args.ranker_model, "rb") as f:
         model_payload = pickle.load(f)
@@ -146,6 +154,7 @@ def main():
     args.out.parent.mkdir(parents=True, exist_ok=True)
     final_output.to_csv(args.out, index=False)
     print(f"Stage 10: Wrote final ranking list of {len(final_output)} rows to {args.out}")
+    print(f"Total pipeline execution time: {time.time() - pipeline_start_time:.2f}s")
 
 
 if __name__ == "__main__":
