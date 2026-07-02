@@ -91,9 +91,18 @@ def main():
     print(f"Retrieved shortlist size: {len(shortlist_indices)} unique candidates.")
 
     # Get active shortlist candidates
-    shortlist_df = df_feat[df_feat.index.isin(shortlist_indices)].copy()
-    shortlist_df = shortlist_df[shortlist_df["candidate_id"].isin(active_ids)].reset_index(drop=True)
+    if len(active_ids) <= 1500:
+        shortlist_df = df_feat[df_feat["candidate_id"].isin(active_ids)].copy().reset_index(drop=True)
+    else:
+        shortlist_df = df_feat[df_feat.index.isin(shortlist_indices)].copy()
+        shortlist_df = shortlist_df[shortlist_df["candidate_id"].isin(active_ids)].reset_index(drop=True)
+    
     print(f"Active shortlist size after filtering: {len(shortlist_df)} candidates.")
+    
+    if len(shortlist_df) == 0:
+        print("Warning: No active candidates found in features dataset. Writing empty submission.")
+        pd.DataFrame(columns=["candidate_id", "rank", "score", "reasoning"]).to_csv(args.out, index=False)
+        return
 
     print("Stage 4: Computing structured candidate features...")
     features_list = []
@@ -143,7 +152,7 @@ def main():
     non_hp_df = non_hp_df.sort_values(by=["score", "candidate_id_num"], ascending=[False, True])
 
     top_100 = non_hp_df.head(100).copy()
-    top_100["rank"] = range(1, 101)
+    top_100["rank"] = range(1, len(top_100) + 1)
 
     print("Stage 9: Generating reasoning for finalists...")
     top_100["reasoning"] = generate_reasonings(top_100)

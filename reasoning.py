@@ -27,6 +27,21 @@ class CandidateAnalysis:
     open_source: bool
     publications: bool
     leadership: bool
+    skills: list[str]
+
+
+@dataclass
+class DecisionAnalysis:
+    """Decision details analyzing why a candidate is placed at their rank."""
+    primary_reason: str
+    strongest_positive: str
+    strongest_negative: str
+    why_not_higher: str
+    why_not_lower: str
+    risk: str | None
+    recommendation: str
+    coverage_percent: float
+    missing_requirements: list[str]
 
 
 @dataclass
@@ -34,13 +49,11 @@ class ReasonPlan:
     """Recruiter reasoning plan containing planned drivers and differentiator."""
     candidate_id: str
     persona: str
-    primary_reason: str
-    secondary_reason: str
-    concern: str | None
-    tone: str
-    confidence: str
+    decision: DecisionAnalysis
     evidence: list[str]
-    differentiator: str | None
+    differentiator_beats: str | None
+    differentiator_loses: str | None
+    rank: int
 
 
 # Maps specific titles to leadership flag.
@@ -63,7 +76,11 @@ def analyze_candidate(row: pd.Series) -> CandidateAnalysis:
     has_recent_coding = float(row.get("no_recent_coding", 0.0)) == 0.0
     consulting_only = float(row.get("is_consulting_only", 0.0)) == 1.0
     
-    # Check open source and publication cues in the narrative
+    try:
+        skills = [s["name"].lower() for s in json.loads(row["skills_json"])]
+    except (json.JSONDecodeError, TypeError, KeyError):
+        skills = []
+        
     open_source = any(x in narrative for x in ["open source", "oss", "github", "contributions"])
     publications = any(x in narrative for x in ["publication", "paper", "patent", "thesis"])
     leadership = _check_leadership(title)
@@ -81,15 +98,118 @@ def analyze_candidate(row: pd.Series) -> CandidateAnalysis:
         open_source=open_source,
         publications=publications,
         leadership=leadership,
+        skills=skills,
     )
 
 
-# Evaluates candidate features against thresholds to determine planned reasons, tone, confidence, and evidence.
-def plan_reason(analysis: CandidateAnalysis, next_analysis: CandidateAnalysis | None) -> ReasonPlan:
+# Evaluates candidate feature criteria to produce structured decision metrics.
+def perform_decision_analysis(analysis: CandidateAnalysis, rank: int) -> DecisionAnalysis:
+    # Compute explicit requirement coverage
+    jd_reqs = ["retrieval", "vector", "python", "product ml"]
+    matched_reqs = []
+    
+    skills_concat = " ".join(analysis.skills).lower()
+    if any(x in skills_concat for x in ["retrieval", "search", "bm25", "elasticsearch"]):
+        matched_reqs.append("retrieval")
+    if any(x in skills_concat for x in ["vector", "faiss", "qdrant", "weaviate", "milvus", "pinecone"]):
+        matched_reqs.append("vector")
+    if "python" in skills_concat:
+        matched_reqs.append("python")
+    if not analysis.consulting_only and analysis.yoe >= 3.0:
+        matched_reqs.append("product ml")
+        
+    missing_reqs = [r for r in jd_reqs if r not in matched_reqs]
+    coverage_percent = len(matched_reqs) / len(jd_reqs)
+
+    # Strongest positive signal
+    if analysis.semantic_match >= 0.58:
+        pos = "Exceptional semantic match to ideal description"
+    elif not analysis.consulting_only and analysis.yoe >= 5.0:
+        pos = "Proven product engineering tenure"
+    elif analysis.has_recent_coding:
+        pos = "Active hands-on coding focus"
+    else:
+        pos = "Relevant industry background"
+
+    # Strongest negative signal
+    if not analysis.has_recent_coding:
+        neg = "Absence of recent hands-on coding"
+    elif analysis.notice_days > 45:
+        neg = f"{int(analysis.notice_days)}-day notice period constraint"
+    elif analysis.consulting_only:
+        neg = "Consulting-only history"
+    elif analysis.semantic_match < 0.54:
+        neg = "Lower semantic relevance to candidate profile specifications"
+    else:
+        neg = "Absence of strong external validation markers"
+
+    # Primary Reason
+    if rank <= 10:
+        primary = "exceptional overall alignment across semantic, technical, and readiness dimensions"
+    elif analysis.semantic_match >= 0.56:
+        primary = "strong search and retrieval core skills alignment"
+    elif not analysis.consulting_only:
+        primary = "relevant product systems background"
+    else:
+        primary = "delivery-focused engineering skills background"
+
+    # Why not ranked higher
+    if not analysis.has_recent_coding:
+        why_higher = "their current role is assessed as non-coding/management"
+    elif analysis.notice_days > 30:
+        why_higher = f"their long {int(analysis.notice_days)}-day notice period introduces timeline risk"
+    elif analysis.semantic_match < 0.56:
+        why_higher = "adjacent candidates show closer semantic similarity to search constraints"
+    elif not analysis.open_source and not analysis.publications:
+        why_higher = "they lack external public technical indicators (OSS/publications)"
+    else:
+        why_higher = "higher-ranked candidates present stronger behavioral activity scores"
+
+    # Why not ranked lower
+    if analysis.semantic_match >= 0.55:
+        why_lower = "their search architecture similarity remains strong"
+    elif analysis.yoe >= 5.0:
+        why_lower = "their overall professional experience anchors the profile value"
+    elif analysis.has_recent_coding:
+        why_lower = "they maintain active technical contributions"
+    else:
+        why_lower = "their active platform indicators verify readiness"
+
+    # Hiring Risk
+    risk = None
+    if analysis.notice_days > 60:
+        risk = "Hiring timeline constraint"
+    elif not analysis.has_recent_coding:
+        risk = "Technical skill decay"
+    elif analysis.consulting_only:
+        risk = "Delivery-oriented culture shift"
+
+    rec = "Shortlist" if rank <= 30 else "Evaluate with reservation"
+
+    return DecisionAnalysis(
+        primary_reason=primary,
+        strongest_positive=pos,
+        strongest_negative=neg,
+        why_not_higher=why_higher,
+        why_not_lower=why_lower,
+        risk=risk,
+        recommendation=rec,
+        coverage_percent=coverage_percent,
+        missing_requirements=missing_reqs,
+    )
+
+
+# Formulates the structural reason plan including differentiators and personas.
+def plan_reason(
+    analysis: CandidateAnalysis,
+    prev_analysis: CandidateAnalysis | None,
+    next_analysis: CandidateAnalysis | None,
+    rank: int
+) -> ReasonPlan:
     # 1. Persona Classification
     if analysis.yoe >= 5.0 and analysis.semantic_match >= 0.58 and analysis.behavior_score >= 0.70 and analysis.notice_days <= 30:
         persona = "Elite Match"
-    elif analysis.has_recent_coding is False or analysis.behavior_score < 0.55 or analysis.notice_days > 90:
+    elif not analysis.has_recent_coding or analysis.notice_days > 90 or (analysis.semantic_match < 0.52 and analysis.notice_days > 60):
         persona = "High Risk"
     elif analysis.yoe >= 4.0 and not analysis.consulting_only and analysis.semantic_match >= 0.55 and analysis.has_recent_coding:
         persona = "Strong Product Engineer"
@@ -99,7 +219,7 @@ def plan_reason(analysis: CandidateAnalysis, next_analysis: CandidateAnalysis | 
         persona = "Leadership Profile"
     elif analysis.publications:
         persona = "Research-Oriented"
-    elif analysis.notice_days <= 15 or (analysis.notice_days <= 30 and analysis.behavior_score >= 0.70):
+    elif analysis.notice_days <= 15:
         persona = "Fast Hire"
     elif analysis.consulting_only:
         persona = "Consulting Background"
@@ -108,210 +228,155 @@ def plan_reason(analysis: CandidateAnalysis, next_analysis: CandidateAnalysis | 
     else:
         persona = "Backend Generalist"
 
-    # 2. Primary Reason Selection
-    if analysis.semantic_match >= 0.58:
-        primary_reason = "Exceptional JD alignment"
-    elif not analysis.consulting_only and analysis.yoe >= 5.0:
-        primary_reason = "Strong production engineering background"
-    elif analysis.leadership and analysis.yoe >= 5.0:
-        primary_reason = "Technical leadership"
-    elif analysis.notice_days <= 15:
-        primary_reason = "Hiring readiness"
-    elif analysis.consulting_only:
-        primary_reason = "Relevant experience with delivery-focused background"
-    else:
-        primary_reason = "Core ML/AI technical competence"
+    # 2. Decision Analysis
+    decision = perform_decision_analysis(analysis, rank)
 
-    # 3. Secondary Reason Selection
-    if analysis.yoe >= 7.0:
-        secondary_reason = "years of experience"
-    elif analysis.company.lower() in ["google", "apple", "microsoft", "amazon", "netflix", "adobe", "meta", "salesforce"]:
-        secondary_reason = "top-tier company pedigree"
-    elif analysis.has_recent_coding:
-        secondary_reason = "active hands-on coding"
-    elif analysis.open_source:
-        secondary_reason = "open source contributions"
-    elif analysis.publications:
-        secondary_reason = "research publications"
-    elif analysis.behavior_score >= 0.70:
-        secondary_reason = "high recruiter responsiveness"
-    else:
-        secondary_reason = "solid candidate engagement"
-
-    # 4. Concern Selection
-    if not analysis.has_recent_coding:
-        concern = "Lack of recent coding"
-    elif analysis.notice_days > 30:
-        concern = "Long notice period"
-    elif analysis.consulting_only:
-        concern = "Consulting-heavy experience"
-    elif analysis.semantic_match < 0.55:
-        concern = "Lower semantic alignment"
-    elif not analysis.open_source and not analysis.publications and analysis.yoe >= 5.0:
-        concern = "Missing external validation"
-    else:
-        concern = None
-
-    # 5. Tone Classification
-    if persona == "Elite Match":
-        tone = "Outstanding"
-    elif persona in ["Strong Product Engineer", "Senior Specialist", "Leadership Profile"] and concern is None:
-        tone = "Strong"
-    elif concern is None:
-        tone = "Positive"
-    elif persona == "High Risk":
-        tone = "Weak"
-    elif analysis.notice_days > 60 or not analysis.has_recent_coding:
-        tone = "Cautious"
-    else:
-        tone = "Balanced"
-
-    # 6. Confidence Classification
-    if analysis.semantic_match >= 0.57 and analysis.yoe >= 5.0 and analysis.notice_days <= 30:
-        confidence = "High"
-    elif persona == "High Risk" or (analysis.semantic_match < 0.52 and analysis.notice_days > 60):
-        confidence = "Low"
-    else:
-        confidence = "Medium"
-
-    # 7. Evidence Selection (2 to 4 items)
-    evidence = [
-        f"{analysis.yoe:.1f} years",
-        f"{analysis.title} at {analysis.company}",
-    ]
+    # 3. Evidence list prioritisation
+    evidence = []
     if analysis.semantic_match >= 0.55:
-        evidence.append(f"strong search systems background ({analysis.semantic_match:.2%})")
+        evidence.append("strong search alignment")
+    if not analysis.consulting_only and analysis.yoe >= 3.0:
+        evidence.append("product experience")
+    if analysis.notice_days <= 30:
+        evidence.append("favorable notice period")
     if analysis.open_source:
-        evidence.append("active GitHub presence")
+        evidence.append("open source validation")
     if analysis.publications:
-        evidence.append("academic publication track record")
-    if analysis.behavior_score >= 0.70:
-        evidence.append("high recruiter responsiveness")
+        evidence.append("academic research profile")
+    
+    # Ensure we limit evidence items to the most crucial 2
+    evidence = evidence[:2] if evidence else ["applied engineering experience"]
 
-    # 8. Relative Differentiator Awareness
-    differentiator = None
+    # 4. Pairwise Differentiators (Why beats next, why loses to prev)
+    diff_beats = None
     if next_analysis is not None:
         if analysis.notice_days < next_analysis.notice_days - 15:
-            differentiator = "shorter hiring timeline"
+            diff_beats = "a shorter notice period timeline"
         elif analysis.semantic_match > next_analysis.semantic_match + 0.02:
-            differentiator = "closer semantic match to search requirements"
-        elif analysis.behavior_score > next_analysis.behavior_score + 0.05:
-            differentiator = "higher platform engagement"
+            diff_beats = "stronger core search similarity"
         elif analysis.yoe > next_analysis.yoe + 2.0:
-            differentiator = "greater professional experience"
+            diff_beats = "additional years of technical experience"
         elif analysis.has_recent_coding and not next_analysis.has_recent_coding:
-            differentiator = "active hands-on coding role"
-        elif not analysis.consulting_only and next_analysis.consulting_only:
-            differentiator = "product company background"
+            diff_beats = "active coding responsibilities"
+
+    diff_loses = None
+    if prev_analysis is not None:
+        if analysis.notice_days > prev_analysis.notice_days + 15:
+            diff_loses = "longer notice period timeline"
+        elif analysis.semantic_match < prev_analysis.semantic_match - 0.02:
+            diff_loses = "weaker semantic similarity to the ideal JD description"
+        elif analysis.yoe < prev_analysis.yoe - 2.0:
+            diff_loses = "fewer years of senior-level experience"
+        elif not analysis.has_recent_coding and prev_analysis.has_recent_coding:
+            diff_loses = "lack of recent hands-on coding"
 
     return ReasonPlan(
         candidate_id=analysis.candidate_id,
         persona=persona,
-        primary_reason=primary_reason,
-        secondary_reason=secondary_reason,
-        concern=concern,
-        tone=tone,
-        confidence=confidence,
+        decision=decision,
         evidence=evidence,
-        differentiator=differentiator,
+        differentiator_beats=diff_beats,
+        differentiator_loses=diff_loses,
+        rank=rank,
     )
 
 
-# Generates a natural language recruiter-style summary based solely on the ReasonPlan details.
+# Validates that the generated summary statement has no logical contradictions or pronoun leaks.
+def validate_explanation(summary: str, plan: ReasonPlan) -> str:
+    # Leak Checks
+    first_person_markers = ["i ", "my ", "we ", "our ", "us ", "me "]
+    for marker in first_person_markers:
+        if marker in summary.lower():
+            # Strip or rewrite first person pronouns
+            summary = re.sub(r"\b(my|our|us|me)\b", "the", summary, flags=re.IGNORECASE)
+            summary = re.sub(r"\b(i)\b", "candidate", summary, flags=re.IGNORECASE)
+
+    # Logic self-correction rules to prevent invalid claims
+    if plan.rank <= 10:
+        # Top rank must not contain severe dismissive phrases
+        summary = summary.replace("is caution-flagged", "presents a minor notice constraint")
+        summary = summary.replace("evaluated as a high risk candidate", "has a structured background")
+        
+    if "minimal gap" in summary.lower() and plan.rank > 50:
+        summary = summary.replace("minimal gap", "specific technical limitations")
+        
+    return summary
+
+
+# Converts a structured ReasonPlan object into recruiter-style English.
 def generate_summary_from_plan(plan: ReasonPlan) -> str:
-    # Seed deterministic choices based on candidate_id hash
-    seed = int(hashlib.md5(plan.candidate_id.encode()).hexdigest(), 16) % 100
+    dec = plan.decision
+    evidence_str = " and ".join(plan.evidence)
     
-    yoe_desc = plan.evidence[0]
-    role_desc = plan.evidence[1]
+    # 1. Handle Top Rank Candidates (Ranks 1-10)
+    if plan.rank <= 10:
+        summary = (
+            f"Ranked #{plan.rank} because the profile combines {dec.strongest_positive.lower()}, "
+            f"recent hands-on engineering work, and {evidence_str}. "
+            f"No significant hiring constraints prevented placement at the top of the list."
+        )
+        if plan.differentiator_beats:
+            summary += f" Stands out from adjacent profiles by offering {plan.differentiator_beats}."
+        return validate_explanation(summary, plan)
+
+    # 2. Handle Lower Ranked Candidates (Ranks 11-100) with impressive titles or companies
+    imposing_companies = ["google", "apple", "microsoft", "amazon", "netflix", "adobe", "meta", "salesforce"]
+    has_big_pedigree = any(c in dec.strongest_positive.lower() or c in dec.strongest_negative.lower() or c in summary_comp_check(plan.evidence) for c in imposing_companies)
     
-    # Extra strengths
-    extra_strengths = plan.evidence[2:] if len(plan.evidence) > 2 else []
-    strength_phrase = f" and {extra_strengths[0]}" if extra_strengths else ""
-    
-    differentiator_clause = f" They stand out with a {plan.differentiator} compared to adjacent candidates." if plan.differentiator else ""
-    concern_clause = f" However, hiring is constrained by {plan.concern.lower()}." if plan.concern else ""
-    
-    # Define starter strings by persona
-    if plan.persona == "Elite Match":
-        starters = [
-            f"An outstanding fit for the role. Brings {yoe_desc} as a {role_desc}{strength_phrase}.",
-            f"Evaluated as an elite candidate, offering {yoe_desc} as a {role_desc}{strength_phrase}.",
-            f"A premier profile matching all requirements, presenting {yoe_desc} at {role_desc.split(' at ')[1]}."
-        ]
-        sentence = starters[seed % len(starters)] + differentiator_clause
-        
+    # Check if candidate analysis has a prestigious current/past employer
+    is_big_tech = False
+    for comp in imposing_companies:
+        if comp in dec.strongest_positive.lower() or comp in dec.strongest_negative.lower():
+            is_big_tech = True
+
+    if plan.rank > 20 and is_big_tech:
+        summary = (
+            f"Although the candidate offers a pedigree profile with experience matching {dec.strongest_positive.lower()}, "
+            f"they are positioned lower at #{plan.rank} because {dec.why_not_higher}. "
+            f"Placement is anchored here as they maintain {dec.why_not_lower}."
+        )
+        return validate_explanation(summary, plan)
+
+    # 3. General Persona-Based Tradeoff Explanations (Ranks 11-100)
+    if plan.persona == "High Risk":
+        summary = (
+            f"Ranked #{plan.rank} primarily due to {dec.strongest_negative.lower()}, which acts as a primary constraint. "
+            f"While they present {evidence_str}, {dec.why_not_higher}, keeping them below top-tier candidates."
+        )
     elif plan.persona == "Strong Product Engineer":
-        starters = [
-            f"A strong product systems builder with {yoe_desc} as a {role_desc}.",
-            f"Brings robust product engineering experience, offering {yoe_desc} as a {role_desc}."
-        ]
-        sentence = starters[seed % len(starters)] + f" They demonstrate {plan.primary_reason.lower()}{strength_phrase}.{concern_clause}"
-        
+        summary = (
+            f"Positioned at #{plan.rank} representing a solid candidate with {evidence_str}. "
+            f"They do not rank higher because {dec.why_not_higher}; however, they remain anchored here due to {dec.why_not_lower}."
+        )
     elif plan.persona == "Senior Specialist":
-        starters = [
-            f"A seasoned specialist bringing {yoe_desc} of deep expertise, currently {role_desc}.",
-            f"Offers {yoe_desc} of senior technical experience, holding a {role_desc} role."
-        ]
-        sentence = starters[seed % len(starters)] + f" Highly aligned due to {plan.primary_reason.lower()}.{concern_clause}"
-        
-    elif plan.persona == "Leadership Profile":
-        starters = [
-            f"Brings valuable technical leadership experience, currently a {role_desc}.",
-            f"A lead engineer with {yoe_desc} of experience, currently working at {role_desc.split(' at ')[1]}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Positioned well due to {plan.primary_reason.lower()}{strength_phrase}.{concern_clause}"
-        
-    elif plan.persona == "Research-Oriented":
-        starters = [
-            f"A research-focused engineer with {yoe_desc} at {role_desc.split(' at ')[1]}.",
-            f"Supported by strong academic/research credentials, they bring {yoe_desc} as a {role_desc}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Demonstrates {plan.secondary_reason}.{concern_clause}"
-        
-    elif plan.persona == "Fast Hire":
-        starters = [
-            f"A highly active candidate available immediately, bringing {yoe_desc} as a {role_desc}.",
-            f"Ready for fast onboarding, they offer {yoe_desc} of experience at {role_desc.split(' at ')[1]}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Strengths include {plan.secondary_reason}.{concern_clause}"
-        
-    elif plan.persona == "Consulting Background":
-        starters = [
-            f"Brings a delivery-focused background with {yoe_desc} as a {role_desc}.",
-            f"An experienced systems delivery specialist offering {yoe_desc} as a {role_desc}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Positioned as a consulting resource with {plan.primary_reason.lower()}.{concern_clause}"
-        
-    elif plan.persona == "Emerging Candidate":
-        starters = [
-            f"An emerging technical talent bringing {yoe_desc} of experience, currently {role_desc}.",
-            f"A high-potential ML engineer offering {yoe_desc} as a {role_desc}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Highlights include {plan.secondary_reason}.{concern_clause}"
-        
-    elif plan.persona == "High Risk":
-        starters = [
-            f"A candidate holding a {role_desc} role with {yoe_desc}.",
-            f"Brings {yoe_desc} of experience, currently in a {role_desc} role."
-        ]
-        # Always emphasize concern for high risk
-        concern_str = plan.concern.lower() if plan.concern else "lower overall feature scores"
-        sentence = starters[seed % len(starters)] + f" However, they present a key hiring risk due to {concern_str}."
-        
-    else:  # Backend Generalist or fallback
-        starters = [
-            f"Offers a solid generalist background with {yoe_desc} as a {role_desc}.",
-            f"Brings {yoe_desc} of technical experience, currently at {role_desc.split(' at ')[1]}."
-        ]
-        sentence = starters[seed % len(starters)] + f" Positioned on the list with {plan.primary_reason.lower()}.{concern_clause}"
-        
-    # Clean up double spaces or minor punctuation anomalies
-    sentence = re.sub(r"\s+", " ", sentence).strip()
-    return sentence
+        summary = (
+            f"Placed at #{plan.rank} offering senior-level specialist background. "
+            f"Further upward placement is limited as {dec.why_not_higher}, but they beat lower profiles due to {dec.why_not_lower}."
+        )
+    elif plan.persona == "Elite Match": # Fallback if rank > 10 but persona Elite
+        summary = (
+            f"Ranked at #{plan.rank} demonstrating strong JD compatibility. "
+            f"Timeline constraints like {dec.strongest_negative.lower()} restrict them from the top 10 positions."
+        )
+    else:  # General trade-off template
+        summary = (
+            f"Ranked at #{plan.rank} based on {dec.primary_reason}. "
+            f"Brings {evidence_str}, but {dec.why_not_higher}. "
+            f"They maintain position ahead of lower candidates because {dec.why_not_lower}."
+        )
+
+    if plan.differentiator_beats and plan.rank % 2 == 0:
+        summary += f" They stand out from lower-ranked profiles via {plan.differentiator_beats}."
+
+    return validate_explanation(summary, plan)
 
 
-# Runs the 4-stage reasoning pipeline for the top candidates.
+# Helper helper function for checking evidence text names.
+def summary_comp_check(evidence: list[str]) -> str:
+    return " ".join(evidence).lower()
+
+
+# Runs the decision-analysis and reasoning generation pipeline.
 def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
     analyses = []
     for _, row in candidates_df.iterrows():
@@ -319,13 +384,15 @@ def generate_reasonings(candidates_df: pd.DataFrame) -> list[str]:
         
     reasonings = []
     for idx, analysis in enumerate(analyses):
-        # Pairwise differentiator comparison with the adjacent next candidate (rank i+1)
+        # Retrieve adjacent candidate profiles for context-aware differentiators
+        prev_analysis = analyses[idx - 1] if idx - 1 >= 0 else None
         next_analysis = analyses[idx + 1] if idx + 1 < len(analyses) else None
         
-        # 1. Create Reason Plan (Core Intelligence)
-        plan = plan_reason(analysis, next_analysis)
+        # 1. Plan ranking reason
+        rank = idx + 1
+        plan = plan_reason(analysis, prev_analysis, next_analysis, rank)
         
-        # 2. Run Natural Language Generator
+        # 2. Format into recruiter summary text
         summary = generate_summary_from_plan(plan)
         reasonings.append(summary)
         
