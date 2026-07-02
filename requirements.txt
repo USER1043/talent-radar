@@ -17,4 +17,4 @@ torch==2.12.1
 tokenizers==0.22.2
 accelerate==1.14.0
 huggingface-hub==1.21.0
-streamlit==1.40.0
+streamlit==1.45.1
