@@ -96,6 +96,36 @@ def check_candidate(row, company_stats: dict) -> tuple[bool, list[str]]:
     if row["tenure_consistency_mismatches"] > 0:
         reasons.append("duration_months inconsistent with start/end dates")
 
+    # Rule 6 -- education sequence is logically impossible
+    DEGREE_RANK = {
+        "phd": 3, "me": 2, "mtech": 2, "mba": 2, "msc": 2,
+        "be": 1, "btech": 1, "bsc": 1, "ba": 1
+    }
+    try:
+        education = json.loads(row["education_json"])
+    except Exception:
+        education = []
+        
+    for edu1 in education:
+        deg1 = (edu1.get("degree") or "").lower().replace(".", "").strip()
+        rank1 = DEGREE_RANK.get(deg1)
+        end1 = edu1.get("end_year")
+        if rank1 is None or end1 is None:
+            continue
+            
+        for edu2 in education:
+            deg2 = (edu2.get("degree") or "").lower().replace(".", "").strip()
+            rank2 = DEGREE_RANK.get(deg2)
+            start2 = edu2.get("start_year")
+            if rank2 is None or start2 is None:
+                continue
+                
+            if rank1 > rank2 and end1 < start2:
+                reasons.append("logically impossible education sequence")
+                break
+        if "logically impossible education sequence" in reasons:
+            break
+
     return (len(reasons) > 0), reasons
 
 
