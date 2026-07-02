@@ -1,5 +1,5 @@
 # Core data processing
-pandas==3.0.3
+pandas==2.2.3
 pyarrow==24.0.0
 scikit-learn==1.9.0
 
